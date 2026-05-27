@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{{ title }}</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #1f2328; }
+    h1 { margin-bottom: 0.25rem; }
+    h2 { margin-top: 2rem; border-bottom: 1px solid #d0d7de; padding-bottom: 0.25rem; }
+    .meta { color: #57606a; margin-bottom: 1.5rem; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border-bottom: 1px solid #d0d7de; padding: 8px 12px; text-align: left; vertical-align: top; }
+    th { background: #f6f8fa; }
+    .v-REAL      { color: #1a7f37; font-weight: 600; }
+    .v-FAKE      { color: #cf222e; font-weight: 600; }
+    .v-UNCERTAIN { color: #9a6700; font-weight: 600; }
+    .v-NO_FACE   { color: #57606a; }
+    .v-ERROR     { color: #cf222e; font-style: italic; }
+    .score-bar { display: inline-block; width: 120px; height: 8px; background: #d0d7de; border-radius: 4px; vertical-align: middle; margin-right: 6px; overflow: hidden; }
+    .score-fill { height: 100%; background: linear-gradient(to right, #1a7f37, #9a6700, #cf222e); }
+    .timeline { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 11px; color: #57606a; }
+    .timeline span { display: inline-block; width: 6px; height: 14px; margin-right: 1px; vertical-align: middle; }
+    .detail { background: #f6f8fa; border-radius: 6px; padding: 1rem; margin: 1rem 0; }
+    .detail h3 { margin: 0 0 0.5rem 0; font-size: 1rem; }
+    .detail .path { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; color: #57606a; word-break: break-all; }
+    .segs { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; margin-top: 0.5rem; }
+    .segs li { margin: 2px 0; }
+    .chart { background: white; border: 1px solid #d0d7de; border-radius: 4px; margin-top: 0.5rem; }
+    .chart text { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 10px; fill: #57606a; }
+    .chart .grid { stroke: #eaeef2; stroke-width: 1; }
+    .chart .thresh { stroke: #cf222e; stroke-dasharray: 4 3; stroke-width: 1; opacity: 0.6; }
+    .chart .uncert { fill: #fff8c5; opacity: 0.4; }
+    .chart .seg { fill: #cf222e; opacity: 0.10; }
+    .chart .line { fill: none; stroke: #0969da; stroke-width: 1.5; }
+    .chart .pt { fill: #0969da; }
+    .anchor { color: #0969da; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <h1>{{ title }}</h1>
+  <div class="meta">{{ rows | length }} files analyzed. Threshold: {{ '%.2f' | format(threshold) }}. Uncertain band: [{{ '%.2f' | format(uncertain_lo) }}, {{ '%.2f' | format(uncertain_hi) }}].</div>
+  <table>
+    <thead>
+      <tr>
+        <th>File</th>
+        <th>Kind</th>
+        <th>Verdict</th>
+        <th>Score</th>
+        <th>Faces</th>
+        <th>Segments</th>
+        <th>Time (s)</th>
+        <th>Timeline</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in rows %}
+      <tr>
+        <td>
+          {% if r.kind == 'video' and r.frame_scores %}
+          <a class="anchor" href="#file-{{ loop.index0 }}">{{ r.path }}</a>
+          {% else %}
+          {{ r.path }}
+          {% endif %}
+        </td>
+        <td>{{ r.kind }}</td>
+        <td class="v-{{ r.verdict }}">{{ r.verdict }}</td>
+        <td>
+          <span class="score-bar"><span class="score-fill" style="width: {{ (r.score * 100) | round(1) }}%; display:block;"></span></span>
+          {{ '%.3f' | format(r.score) }}
+        </td>
+        <td>{{ r.faces_analyzed }}</td>
+        <td>{{ r.segments | length }}</td>
+        <td>{{ '%.2f' | format(r.processing_time_s) }}</td>
+        <td class="timeline">
+          {% for fs in r.frame_scores %}
+            {% set hue = (120 - (fs.score * 120)) | int %}
+            <span title="t={{ fs.t }}s score={{ fs.score }}" style="background: hsl({{ hue }}, 70%, 45%);"></span>
+          {% endfor %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  {% for r in rows %}
+    {% if r.kind == 'video' and r.frame_scores %}
+    <div class="detail" id="file-{{ loop.index0 }}">
+      <h3>{{ r.path.split('/')[-1] }} — <span class="v-{{ r.verdict }}">{{ r.verdict }}</span> ({{ '%.3f' | format(r.score) }})</h3>
+      <div class="path">{{ r.path }}</div>
+
+      {# Sparkline-ish SVG line chart of score vs. time. Width is responsive
+         to frame count so 1000-frame videos still draw a useful curve. #}
+      {% set chart_w = 720 %}
+      {% set chart_h = 140 %}
+      {% set pad_l = 30 %}
+      {% set pad_r = 10 %}
+      {% set pad_t = 8 %}
+      {% set pad_b = 18 %}
+      {% set plot_w = chart_w - pad_l - pad_r %}
+      {% set plot_h = chart_h - pad_t - pad_b %}
+      {% set t_max = r.frame_scores[-1].t if r.frame_scores else 1.0 %}
+      {% set t_span = t_max if t_max > 0 else 1.0 %}
+      <svg class="chart" viewBox="0 0 {{ chart_w }} {{ chart_h }}" width="100%">
+        <!-- horizontal gridlines at 0.25 / 0.5 / 0.75 -->
+        {% for g in [0.0, 0.25, 0.5, 0.75, 1.0] %}
+          {% set y = pad_t + (1.0 - g) * plot_h %}
+          <line class="grid" x1="{{ pad_l }}" y1="{{ y }}" x2="{{ pad_l + plot_w }}" y2="{{ y }}"/>
+          <text x="{{ pad_l - 4 }}" y="{{ y + 3 }}" text-anchor="end">{{ '%.2f' | format(g) }}</text>
+        {% endfor %}
+        <!-- uncertain band -->
+        {% set u_top = pad_t + (1.0 - uncertain_hi) * plot_h %}
+        {% set u_bot = pad_t + (1.0 - uncertain_lo) * plot_h %}
+        <rect class="uncert" x="{{ pad_l }}" y="{{ u_top }}" width="{{ plot_w }}" height="{{ u_bot - u_top }}"/>
+        <!-- threshold line -->
+        {% set th_y = pad_t + (1.0 - threshold) * plot_h %}
+        <line class="thresh" x1="{{ pad_l }}" y1="{{ th_y }}" x2="{{ pad_l + plot_w }}" y2="{{ th_y }}"/>
+        <!-- segment shading -->
+        {% for seg in r.segments %}
+          {% set sx1 = pad_l + (seg.t_start / t_span) * plot_w %}
+          {% set sx2 = pad_l + (seg.t_end / t_span) * plot_w %}
+          <rect class="seg" x="{{ sx1 }}" y="{{ pad_t }}" width="{{ [sx2 - sx1, 2] | max }}" height="{{ plot_h }}"/>
+        {% endfor %}
+        <!-- score polyline -->
+        <polyline class="line" points="
+          {% for fs in r.frame_scores -%}
+            {{ pad_l + (fs.t / t_span) * plot_w }},{{ pad_t + (1.0 - fs.score) * plot_h }}
+          {% endfor %}
+        "/>
+        <!-- per-frame markers -->
+        {% for fs in r.frame_scores %}
+          <circle class="pt" cx="{{ pad_l + (fs.t / t_span) * plot_w }}" cy="{{ pad_t + (1.0 - fs.score) * plot_h }}" r="2">
+            <title>t={{ fs.t }}s · score={{ fs.score }}</title>
+          </circle>
+        {% endfor %}
+        <!-- x-axis ticks -->
+        {% for tick in [0.0, t_span * 0.25, t_span * 0.5, t_span * 0.75, t_span] %}
+          {% set tx = pad_l + (tick / t_span) * plot_w %}
+          <text x="{{ tx }}" y="{{ chart_h - 4 }}" text-anchor="middle">{{ '%.1f' | format(tick) }}s</text>
+        {% endfor %}
+      </svg>
+
+      {% if r.segments %}
+      <ul class="segs">
+        {% for seg in r.segments %}
+          <li>
+            <span class="v-FAKE">FAKE</span>
+            {{ '%.2f' | format(seg.t_start) }}s &rarr; {{ '%.2f' | format(seg.t_end) }}s
+            ({{ seg.n_frames }} frame{{ 's' if seg.n_frames != 1 else '' }},
+            peak {{ '%.3f' | format(seg.score_peak) }},
+            mean {{ '%.3f' | format(seg.score_mean) }})
+          </li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <div class="segs"><em>No frames crossed the threshold.</em></div>
+      {% endif %}
+    </div>
+    {% endif %}
+  {% endfor %}
+</body>
+</html>

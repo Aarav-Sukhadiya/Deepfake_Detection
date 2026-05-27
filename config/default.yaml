@@ -1,0 +1,60 @@
+# dfdetect default configuration.
+# Override any of these on the CLI or by passing --config <path>.
+
+device: auto              # auto | cuda | cpu
+batch_size: 8             # tuned down on first OOM
+threshold: 0.5            # FAKE if score >= threshold
+uncertain_band: [0.4, 0.6]  # scores inside this band map to UNCERTAIN
+
+input:
+  recursive: false
+  follow_symlinks: false
+  image_exts: [".jpg", ".jpeg", ".png", ".webp", ".bmp"]
+  video_exts: [".mp4", ".mov", ".avi", ".mkv", ".webm"]
+
+preprocess:
+  face_detector: mtcnn        # mtcnn | retinaface
+  face_margin: 0.30
+  input_size: 224
+  min_face_size: 40
+  largest_face_only: true
+
+video:
+  frames_per_second: 1
+  max_frames: 64
+  sampling_strategy: uniform   # uniform | scene | hybrid
+  scene_threshold: 0.6         # HSV-hist correlation; lower = stricter cut detection
+  scene_thumb_size: 64         # thumbnail edge length used for scene detection
+  scene_stride: 0              # 0 = reuse the uniform step; >0 = probe every N source frames
+
+inference:
+  aggregation: mean           # mean | median | max | weighted
+  weighted:
+    mean: 0.6
+    median: 0.2
+    max: 0.2
+
+model:
+  name: efficientnet_b4
+  weights: null               # local path to a .pt/.pth file; null = try url, then ImageNet fallback
+  url: null                   # optional download source for the weights file
+  sha256: null                # optional expected SHA-256 hex digest of the downloaded weights
+  num_classes: 2
+  ensemble: false             # when true, populate `members` below with at least two entries
+  members: []                 # list of {name, weights, url, sha256, weight, calibration}
+  calibration:
+    temperature: 1.0          # T>1 softens, T<1 sharpens; 1.0 is a no-op
+    platt_a: null             # set both platt_a/platt_b to enable post-temperature Platt scaling
+    platt_b: null
+
+storage:
+  db_path: ~/.cache/dfdetect/results.db
+  models_dir: ~/.cache/dfdetect/models
+
+report:
+  default_format: json        # json | csv | html
+  heatmaps: false
+  output_dir: ./reports
+
+logging:
+  level: INFO
