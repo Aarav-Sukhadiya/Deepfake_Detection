@@ -32,17 +32,21 @@ dfdetect analyze <paths...> [options]
 
 | Option | Default | Description |
 |---|---|---|
-| `-c, --config PATH` | bundled `config/default.yaml` | Override any config field. |
-| `-o, --output FORMAT` | `json` | `json`, `csv`, or `html`. |
-| `--output-dir PATH` | `./reports` | Where to write the report file. |
-| `-t, --threshold FLOAT` | `0.5` | FAKE if score ≥ threshold (after the uncertain band). |
-| `-r, --recursive` | off | Descend into subdirectories. |
-| `--gpu` / `--cpu` | auto-detect | Force device. |
-| `-f, --frames-per-second FLOAT` | `1.0` | Video sampling rate. |
-| `-b, --batch-size INT` | `8` | VRAM-tunable batch size. Auto-halves on CUDA OOM. |
-| `--heatmaps` | off | Render Grad-CAM PNGs into `<output-dir>/heatmaps/`. |
+Every option except `--config`, `--model-card` and `--log-level` defaults to **the value in your config**. A flag only overrides the config when you pass it.
+
+| Option | Default | Description |
+|---|---|---|
+| `-c, --config PATH` | bundled `config/default.yaml` | YAML config. Errors if the file doesn't exist. |
+| `-o, --output FORMAT` | `report.default_format` | `json`, `csv`, or `html`. Validated before analysis starts. |
+| `--output-dir PATH` | `report.output_dir` | Where to write the report file. |
+| `-t, --threshold FLOAT` | `threshold` | FAKE if score ≥ threshold (after the uncertain band). Must be in `[0, 1]`. |
+| `-r, --recursive` / `--no-recursive` | `input.recursive` | Descend into subdirectories. |
+| `--gpu` / `--cpu` | `device` | Force device. |
+| `-f, --frames-per-second FLOAT` | `video.frames_per_second` | Video sampling rate (`> 0`). |
+| `-b, --batch-size INT` | `batch_size` | VRAM-tunable batch size (`>= 1`). Auto-halves on CUDA OOM. |
+| `--heatmaps` / `--no-heatmaps` | `report.heatmaps` | Render Grad-CAM PNGs into `<output-dir>/heatmaps/`. |
 | `--model-card` | off | Render a markdown model card alongside the report. |
-| `--log-level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, etc. |
+| `--log-level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, etc. (case-insensitive). |
 
 **Inputs** can be any combination of:
 
@@ -50,7 +54,7 @@ dfdetect analyze <paths...> [options]
 - multiple files (`a.png b.mp4 c.webp`)
 - a directory (uses non-recursive globbing unless `-r` is set)
 
-Unsupported files are silently skipped. Header detection (via `filetype`) takes precedence over file extensions, so files with wrong extensions are still classified correctly.
+Unsupported files are silently skipped. Header detection (via `filetype`) takes precedence over file extensions, so files with wrong extensions are still classified correctly. Files that can't be read at all appear in the report as `ERROR` with an `input:` message. Paths are reported as absolute paths, and the same file passed twice is analyzed once.
 
 #### Examples
 
@@ -90,6 +94,8 @@ dfdetect runs                  # 20 most recent
 dfdetect runs --limit 100
 ```
 
+The **Kind** column shows `analyze` for inference runs and `reverdict (of N)` for runs derived from run `N`.
+
 ### 2.4 `reverdict` — re-threshold an existing run
 
 ```bash
@@ -98,7 +104,7 @@ dfdetect reverdict 17 -t 0.65 --uncertain-lo 0.55 --uncertain-hi 0.70
 dfdetect reverdict 17 --threshold 0.7 --dry-run
 ```
 
-Re-applies the new threshold (and optional uncertain band) to the stored scores from run `17` and prints the updated verdicts. **No inference is re-run.**
+Re-applies the new threshold (and optional uncertain band) to the stored scores from run `17` and prints the updated verdicts. **No inference is re-run.** `--threshold` defaults to the threshold in your config, and the band defaults to the config's `uncertain_band`. Files that failed (`ERROR`) stay `ERROR`, since their stored 0.0 score is a placeholder and not a real prediction.
 
 By default, the new verdicts are **persisted** as a *derived run* that records `parent_run_id = 17`, `kind = "reverdict"`, and the threshold + band used. `dfdetect runs` will then show both the original and the derived row, and `dfdetect query` (or any future read) can target the derived run by its id. Pass `--dry-run` to preview without writing.
 
@@ -116,7 +122,7 @@ dfdetect query --run 17 --path '%clip%.mp4'
 dfdetect query --verdict UNCERTAIN --max-score 0.55 --limit 50
 ```
 
-Pulls rows directly from the SQLite store without re-running inference. `--path` uses SQL `LIKE` syntax (`%` wildcard). Combines with any of `--run`, `--verdict`, `--min-score`, `--max-score`, `--limit`.
+Pulls rows directly from the SQLite store without re-running inference. `--path` uses SQL `LIKE` syntax (`%` wildcard) against the stored absolute path. `--verdict` is case-insensitive and must be one of `REAL`, `FAKE`, `UNCERTAIN`, `NO_FACE`, `ERROR`. Combines with any of `--run`, `--min-score`, `--max-score`, `--limit`. Results are sorted by score, highest first.
 
 ### 2.7 `train` — fine-tune on labelled folders
 
@@ -134,7 +140,19 @@ Hard anti-bias constraints fire **before** any GPU work:
 - Fake/total ratio must be in `[0.2, 0.8]`.
 - Each video-only class must include ≥ 5 distinct source clips (hashed by file head, so a 1000-frame dataset cut from one video is rejected).
 
-Soft warnings are logged for ratios outside `[0.4, 0.6]` or low video-source counts. Output is `model.pt` + a `train.json` manifest (dataset stats, hash, best val loss) in `--output-dir`. Wire the checkpoint back into inference via `model.weights: ./checkpoints/model.pt` in your config.
+Soft warnings are logged for ratios outside `[0.4, 0.6]` or low video-source counts. A violated hard rule prints `Cannot train: …` and exits with code 1.
+
+How the run works:
+
+- **Validation split is by source file.** All frames of a video, including hardlinked duplicates of it, land on the same side. Per-frame splitting leaks near-identical frames into validation and makes val loss meaningless.
+- **Face crops** use MTCNN's largest face, padded by the same 30% margin inference uses. `--no-face-detect` uses whole frames, for pre-cropped datasets.
+- **Speed:** face boxes are computed once and reused in later epochs.
+- **Batch size:** on CUDA the micro-batch is auto-tuned to fit VRAM, with gradient accumulation keeping your `--batch-size` as the effective batch. The tuned value is remembered in `~/.cache/dfdetect/autotune_train.json`.
+- **Resuming:** `resume.pt` is written after every epoch. Re-running the same command, or pressing Ctrl-C and re-running, continues from the last completed epoch, provided the dataset folders and hyper-parameters are unchanged. Raising `--epochs` extends a finished run.
+
+Output is `model.pt` (the best checkpoint by val loss) plus a `train.json` manifest in `--output-dir`. The manifest records dataset stats, train/val sample counts, the face margin, the checkpoint SHA-256, `best_val_loss`, and whether the run was interrupted. `best_val_loss: null` means no validation loss was ever measured.
+
+Wire the checkpoint back into inference via `model.weights: ./checkpoints/model.pt` in your config.
 
 ---
 
@@ -198,7 +216,7 @@ A static, self-contained report with score bars and a per-frame timeline strip (
 
 ### Grad-CAM heatmaps
 
-When `--heatmaps` is set, the most-suspicious face crop per file is saved as a PNG with a heatmap overlay under `<output-dir>/heatmaps/`. The HTML report does not yet inline these — see them on disk, or open them next to the report.
+When `--heatmaps` is set, the most-suspicious face crop per file is saved as a PNG with a Grad-CAM overlay of the **FAKE** class under `<output-dir>/heatmaps/<name>-<hash>.png`. The short path hash keeps same-named files from different folders apart, and `heatmap_path` in the JSON points at the exact file. The HTML report does not yet inline these — see them on disk, or open them next to the report.
 
 ### Per-file SVG timelines (HTML)
 
@@ -307,7 +325,10 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the dataflow.
 | Scores look uncalibrated (everything ~0.5) | Using ImageNet fallback weights | Wire in a deepfake-trained checkpoint — see [MODELS.md](MODELS.md). |
 | Scores systematically over- or under-confident | Calibration not fit | Set `model.calibration.temperature` (>1 softens, <1 sharpens) — see [MODELS.md](MODELS.md#calibration). |
 | `ChecksumError: SHA-256 mismatch for ...` | Downloaded weights don't match the expected hash | Re-check the published `sha256`. The partial download is auto-deleted, so a corrected config will retry cleanly. |
-| `decord` decode errors | Unsupported codec | The pipeline auto-falls back to OpenCV; if that also fails, transcode the file (e.g. `ffmpeg -i in.mkv -c copy out.mp4`). |
+| `decord` decode errors | Unsupported codec | If decord can't open the file, the pipeline falls back to OpenCV. If that also fails, transcode the file (e.g. `ffmpeg -i in.mkv -c copy out.mp4`). |
+| `… is not a tf_efficientnet_b4 checkpoint: N parameters missing` | `model.weights` points at a different architecture or a non-state-dict file | Use a `tf_efficientnet_b4` state dict (what `dfdetect train` writes). `module.` / `model.` key prefixes are handled automatically. |
+| `Invalid value for --config: Config file not found` | Typo in the config path | Fix the path. dfdetect no longer silently falls back to defaults. |
+| Training `best_val_loss` stuck at a suspiciously low value | Checkpoint trained before the source-file split fix | Retrain. Older runs split validation per frame, so val loss was optimistic and `model.pt` could stop updating early. |
 | `RetinaFace requested but insightface is not installed` | Switched detector without the optional dep | `pip install insightface onnxruntime` (or `onnxruntime-gpu` on CUDA), or set `face_detector: mtcnn`. |
 | Gradio UI port in use | `--port 7860` already taken | Pass `--port 9000` (or any free port). |
 

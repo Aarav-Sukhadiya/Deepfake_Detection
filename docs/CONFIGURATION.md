@@ -2,7 +2,14 @@
 
 Every tunable lives in [`config/default.yaml`](../config/default.yaml). Override by passing `--config path/to/yours.yaml` to any CLI command, or by editing the bundled defaults.
 
-Config is validated with pydantic — bad values fail fast at load time with a precise error message.
+Config is validated with pydantic — bad values fail fast at load time with a precise error message. A `--config` path that doesn't exist is an error (it used to silently fall back to defaults); only the bundled default file is optional. The YAML top level must be a mapping.
+
+Any section or key may be omitted; missing values take the code defaults in [`dfdetect/config.py`](../dfdetect/config.py). A minimal config that just points at your trained checkpoint:
+
+```yaml
+model:
+  weights: ./checkpoints/dfd_efficientnet_b4/model.pt
+```
 
 ---
 
@@ -35,10 +42,10 @@ Controls file discovery and validation.
 | Key | Default | Description |
 |---|---|---|
 | `face_detector` | `mtcnn` | `mtcnn` (default) or `retinaface`. `retinaface` requires `pip install insightface onnxruntime` (or `onnxruntime-gpu` on CUDA); pack name overridable via `INSIGHTFACE_MODEL` (default `buffalo_l`). |
-| `face_margin` | `0.30` | Fractional padding around the detected face bbox before cropping. |
+| `face_margin` | `0.30` | Fractional padding around the detected face bbox before cropping. **Keep this equal to the margin the checkpoint was trained with** (`dfdetect train` uses 0.30 and records it in `train.json`). |
 | `input_size` | `224` | Square pixel size fed to the model. Match the model's training resolution. |
 | `min_face_size` | `40` | Minimum face height/width in pixels for the detector. Lower = catch tiny faces, more false positives. |
-| `largest_face_only` | `true` | If `true`, keep only the largest face per frame (ideal for talking-head videos). |
+| `largest_face_only` | `true` | If `true`, keep only the largest face per frame (ideal for talking-head videos). If `false`, every face is scored and faces are grouped into identity tracks (see `inference.track_aggregation`). |
 
 ---
 
@@ -46,8 +53,8 @@ Controls file discovery and validation.
 
 | Key | Default | Description |
 |---|---|---|
-| `frames_per_second` | `1.0` | Uniform sampling rate. `1.0` = one frame per second of source video. |
-| `max_frames` | `64` | Hard cap per video. Long videos won't blow up runtime. |
+| `frames_per_second` | `1.0` | Uniform sampling rate. `1.0` = one frame per second of source video. Must be `> 0`. |
+| `max_frames` | `64` | Hard cap per video (`>= 1`). Long videos won't blow up runtime. Note the cap keeps the *first* `max_frames` samples, so for long videos raise it or lower `frames_per_second` to cover the whole timeline. |
 | `sampling_strategy` | `uniform` | `uniform` (today's behaviour), `scene` (only frames on a detected cut), or `hybrid` (union of both, deduped, capped). |
 | `scene_threshold` | `0.6` | HSV-histogram correlation between consecutive scene-detector thumbnails. **Lower = stricter** — more cuts flagged. Range `[0, 1]`. |
 | `scene_thumb_size` | `64` | Thumbnail edge length for the cut detector. Bigger = more sensitive, slower. |
@@ -117,7 +124,7 @@ See [MODELS.md](MODELS.md) for adding a new model and fitting calibration.
 
 | Key | Default | Description |
 |---|---|---|
-| `db_path` | `~/.cache/dfdetect/results.db` | SQLite database for run history. Auto-created. |
+| `db_path` | `~/.cache/dfdetect/results.db` | SQLite database for run history. Auto-created, and older schemas are migrated automatically on open. |
 | `models_dir` | `~/.cache/dfdetect/models` | Where downloaded weights are cached. |
 
 ---
@@ -126,9 +133,9 @@ See [MODELS.md](MODELS.md) for adding a new model and fitting calibration.
 
 | Key | Default | Description |
 |---|---|---|
-| `default_format` | `json` | Used when CLI omits `--output`. |
+| `default_format` | `json` | Used when the CLI omits `--output`. |
 | `heatmaps` | `false` | Render Grad-CAM PNGs for the most-suspicious face per file. |
-| `output_dir` | `./reports` | Where reports and `heatmaps/` are written. |
+| `output_dir` | `./reports` | Where reports and `heatmaps/` are written. Overridden by `--output-dir`. |
 
 ---
 
@@ -136,7 +143,7 @@ See [MODELS.md](MODELS.md) for adding a new model and fitting calibration.
 
 | Key | Default | Description |
 |---|---|---|
-| `level` | `INFO` | Standard Python log levels. |
+| `level` | `INFO` | Standard Python log levels. Currently the CLI's `--log-level` flag (case-insensitive) is what takes effect. |
 
 ---
 
@@ -144,8 +151,8 @@ See [MODELS.md](MODELS.md) for adding a new model and fitting calibration.
 
 | Key | Default | Description |
 |---|---|---|
-| `workers` | `0` | Threads used to pre-extract face crops while the model is busy on the previous file. `0` = single-threaded (today's behaviour). |
-| `prefetch` | `2` | Maximum number of files preprocessed ahead of inference. Backpressure protects against memory blow-ups when preprocessing is much faster than inference. |
+| `workers` | `0` | Threads used to pre-extract face crops while the model is busy on the previous file. `0` = single-threaded. Must be `>= 0`. |
+| `prefetch` | `2` | Maximum number of files preprocessed ahead of inference (`>= 1`). Backpressure protects against memory blow-ups when preprocessing is much faster than inference. |
 
 The model itself stays on the main thread regardless of `workers` — CUDA contexts aren't safely shared.
 
@@ -155,10 +162,17 @@ The model itself stays on the main thread regardless of `workers` — CUDA conte
 
 For a single field, the highest-priority source wins:
 
-1. CLI flag (`--threshold 0.7`)
-2. `--config <path>` file
+1. CLI flag (`--threshold 0.7`) — **only when the flag is actually passed**. Omitted flags (`--output`, `--output-dir`, `-r`, `--heatmaps`, `--threshold`, …) leave the config value alone.
+2. `--config <path>` file *(replaces the bundled file; it is not merged with it)*
 3. Bundled `config/default.yaml`
 4. Code defaults in [`dfdetect/config.py`](../dfdetect/config.py)
+
+## Environment variables
+
+| Variable | Effect |
+|---|---|
+| `DFDETECT_CACHE` | Directory for autotune state (`autotune.json`, `autotune_train.json`). Default `~/.cache/dfdetect`. `storage.*` paths are configured separately. |
+| `INSIGHTFACE_MODEL` | insightface model pack for `face_detector: retinaface` (default `buffalo_l`). |
 
 ---
 

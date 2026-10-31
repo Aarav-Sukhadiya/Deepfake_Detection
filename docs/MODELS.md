@@ -26,7 +26,7 @@ The bundled EfficientNet-B4 falls back to ImageNet weights so the pipeline runs 
 
 ### Option A — local file
 
-1. Obtain a DFDC- or FaceForensics++-trained `tf_efficientnet_b4` checkpoint (`.pt` or `.pth`).
+1. Obtain a DFDC- or FaceForensics++-trained `tf_efficientnet_b4` checkpoint (`.pt` or `.pth`), or train one with `dfdetect train` (see [USAGE.md](USAGE.md#27-train--fine-tune-on-labelled-folders)).
 2. Place it somewhere stable, e.g. `~/.cache/dfdetect/models/efficientnet_b4_dfdc.pt`.
 3. Point your config at it:
 
@@ -60,7 +60,11 @@ register_weights(
 )
 ```
 
-The loader uses `state_dict` keys non-strictly (`load_state_dict(..., strict=False)`), so checkpoints saved with extra prefixes still load. If your checkpoint was wrapped in `{"state_dict": ...}` that's also handled.
+How checkpoints are loaded:
+
+- `torch.load(..., weights_only=True)`: only tensors and plain containers are accepted, so a malicious `.pt` can't execute code on load. Checkpoints must therefore be **state dicts**, not pickled whole models.
+- A `{"state_dict": ...}` wrapper is unwrapped, and a uniform `module.` (DataParallel/DDP) or `model.` prefix is stripped.
+- **Missing parameters are an error.** A checkpoint from a different architecture raises `RuntimeError: … is not a tf_efficientnet_b4 checkpoint` instead of silently leaving the network randomly initialised. Extra, unexpected keys only log a warning.
 
 After loading, the `model_hash` in your reports is the truncated SHA-256 of the actual file on disk, so you can match a stored run back to the exact weights that produced it.
 
@@ -90,7 +94,11 @@ class Xception(DeepfakeModel):
     name = "xception"
     input_size = 299
 
-    def __init__(self, weights_path: Path | None = None, device: str = "cpu", weights_dir: Path | None = None):
+    # The registry passes weights_dir / weights_url / weights_sha256 too; accept
+    # them (see efficientnet.py for how to use ensure_weights_file with them).
+    def __init__(self, weights_path: Path | None = None, device: str = "cpu",
+                 weights_dir: Path | None = None, weights_url: str | None = None,
+                 weights_sha256: str | None = None):
         super().__init__(weights_path=weights_path, device=device)
         self._model = None
 
@@ -98,10 +106,10 @@ class Xception(DeepfakeModel):
         import timm, torch
         m = timm.create_model("xception", pretrained=self.weights_path is None, num_classes=2)
         if self.weights_path and self.weights_path.exists():
-            state = torch.load(self.weights_path, map_location="cpu")
+            state = torch.load(self.weights_path, map_location="cpu", weights_only=True)
             if isinstance(state, dict) and "state_dict" in state:
                 state = state["state_dict"]
-            m.load_state_dict(state, strict=False)
+            m.load_state_dict(state)   # strict: fail loudly on a mismatched checkpoint
         m.eval().to(self.device)
         self._model = m
 
@@ -145,14 +153,18 @@ model:
 
 ## The `DeepfakeModel` contract
 
-Subclasses must implement four methods. Returning the same shapes the rest of the pipeline expects is the only hard requirement.
+Subclasses must implement three abstract methods; the rest have working defaults. Returning the same shapes the rest of the pipeline expects is the only hard requirement.
 
 | Method | Input | Output | Notes |
 |---|---|---|---|
 | `preprocess(faces)` | `list[np.ndarray]` of HxWx3 RGB uint8 face crops | model-ready batch tensor | Resize to `self.input_size`; normalize per the model's training scheme. |
 | `predict(batch)` | tensor from `preprocess` | `list[float]` of FAKE probabilities, one per crop | Convention: class 1 = FAKE for binary. |
 | `grad_cam_target_layer()` | — | a `torch.nn.Module` | The conv layer Grad-CAM should hook into. Usually the last conv block. |
-| `hash()` | — | `str` | Already provided by `DeepfakeModel.hash()` — sha256 of the weights file, or `"pretrained"` when none. |
+| `grad_cam_model()` | — | `torch.nn.Module` or `None` | *Default provided:* returns `self._model`. Override in wrappers. |
+| `grad_cam_preprocess(faces)` | same as `preprocess` | tensor | *Default provided:* calls `preprocess`. Override if your `preprocess` doesn't return a tensor (as `EnsembleModel` does). |
+| `hash()` | — | `str` | *Default provided:* truncated SHA-256 of the weights file (memoised), or `"pretrained"` when none. |
+
+Class index 1 must be FAKE: heatmaps explain logit 1, and `predict` must return its softmax probability.
 
 Implementations should **lazy-import torch / timm** so the package stays usable without the full ML stack installed (this matters for the test suite).
 
@@ -213,5 +225,5 @@ model:
 Constraints:
 
 - Nested ensembles are not supported (members can't themselves be ensembles).
-- Grad-CAM falls back to the first member, since CAM operates on a single conv graph.
+- Grad-CAM uses the first member (both its network and its preprocessing), since CAM operates on a single conv graph.
 - `model_hash` for an ensemble is `ens(<member1>|<member2>|...)`, so a stored run still uniquely identifies the bag of weights used.

@@ -39,7 +39,9 @@ What it does:
 - `--check` runs the same bias-constraint gate the trainer runs, so you
   catch problems before kicking off the GPU.
 
-Re-running is idempotent: existing hardlinks are kept, stale ones pruned.
+Re-running is idempotent: existing hardlinks are kept, stale ones pruned. Link names carry a stable 6-hex prefix derived from the source path (SHA-1), so the same source always maps to the same link name across runs.
+
+With `--keep-all-fakes`, reals are oversampled by creating several hardlinks per clip. The trainer recognises hardlinks to the same file (same inode) and always keeps them on the same side of the train/val split, so duplicates can't leak into validation.
 
 ## 3. Train
 
@@ -58,7 +60,7 @@ Defaults (overridable via env vars):
 | `LR`       | `1e-4` | Standard fine-tune LR for EfficientNet-B4. |
 | `VIDEO_FPS`| `1.0` | One frame per second of source video. |
 | `MAX_FRAMES` | `32` | Hard cap per clip; prevents long videos from dominating. |
-| `VAL_SPLIT`| `0.1` | Random split. **Caveat below.** |
+| `VAL_SPLIT`| `0.1` | Fraction of samples held out, split **by source clip**. **Caveat below.** |
 
 The launcher runs the bias check first, then training with `--device cuda --amp`.
 
@@ -84,11 +86,17 @@ dfdetect analyze ./samples
   generalize poorly to reenactment / lip-sync / diffusion fakes. Blend
   with FaceForensics++ originals or DFDC for a stronger checkpoint.
 - **Only 28 actors** and the same actor appears in both real and fake.
-  The trainer currently splits train/val *by file*, not by actor, so the
-  validation score will look optimistic. If you care about generalization,
-  hold out a few actor ids manually before running `prepare_dfd.py`
-  (e.g. move 4–5 actors' files into a separate `holdout/` folder and run
-  evaluation against that).
+  The trainer splits train/val *by source clip* (so frames of one clip
+  never straddle the split), but not *by actor*, so the same faces still
+  appear on both sides and the validation score will look optimistic. If
+  you care about generalization, hold out a few actor ids manually before
+  running `prepare_dfd.py` (e.g. move 4–5 actors' files into a separate
+  `holdout/` folder and run evaluation against that).
+- **Checkpoints trained before the source-clip split** (validation split
+  per frame) have unreliable `best_val_loss` values, often near 0, and
+  `model.pt` may be from an early epoch. Retrain them. The old
+  `resume.pt` won't be reused, because the config signature now includes
+  `face_margin`.
 - After training, fit calibration (temperature scaling) against held-out
   data and set `model.calibration.temperature` in the config — see
   [docs/MODELS.md](../docs/MODELS.md#calibration).
