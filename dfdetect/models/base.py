@@ -40,6 +40,12 @@ class DeepfakeModel(ABC):
         """
         return getattr(self, "_model", None)
 
+    def grad_cam_preprocess(self, faces: list[Any]) -> Any:
+        """Tensor input for :meth:`grad_cam_model`. Defaults to :meth:`preprocess`;
+        wrappers whose ``preprocess`` doesn't produce a tensor (ensembles)
+        override this to use the network Grad-CAM actually hooks."""
+        return self.preprocess(faces)
+
     def hash(self) -> str:
         """Hex digest of the loaded weights file (or 'pretrained' fallback).
 

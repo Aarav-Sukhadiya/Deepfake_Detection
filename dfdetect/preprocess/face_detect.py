@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Protocol
 
 import numpy as np
@@ -22,7 +23,7 @@ class FaceDetector(Protocol):
         ...
 
 
-def _expand_bbox(
+def expand_bbox(
     bbox: tuple[float, float, float, float],
     margin: float,
     img_shape: tuple[int, int],
@@ -46,12 +47,14 @@ class MTCNNDetector:
         from facenet_pytorch import MTCNN  # lazy
 
         self._cfg = cfg
+        # ``select_largest=True`` makes ``detect()`` return boxes sorted by
+        # area (largest first). ``keep_all`` only affects ``forward()``, which
+        # we don't use — ``detect()`` always returns every box.
         self._mtcnn = MTCNN(
-            keep_all=not cfg.largest_face_only,
             min_face_size=cfg.min_face_size,
             device=device,
             post_process=False,
-            select_largest=cfg.largest_face_only,
+            select_largest=True,
         )
 
     def detect(
@@ -66,9 +69,11 @@ class MTCNNDetector:
             return []
         if probs is None:
             probs = [1.0] * len(boxes)
+        if self._cfg.largest_face_only:
+            boxes, probs = boxes[:1], probs[:1]
         crops: list[FaceCrop] = []
-        for box, prob in zip(boxes, probs):
-            x1, y1, x2, y2 = _expand_bbox(tuple(box), self._cfg.face_margin, image.shape)
+        for box, prob in zip(boxes, probs, strict=True):
+            x1, y1, x2, y2 = expand_bbox(tuple(box), self._cfg.face_margin, image.shape)
             if x2 <= x1 or y2 <= y1:
                 continue
             crop = image[y1:y2, x1:x2]
@@ -104,11 +109,9 @@ class RetinaFaceDetector:
             if device.startswith("cuda")
             else ["CPUExecutionProvider"]
         )
-        # name="buadfa" is the lightest bundled detection-only pack; the user can
-        # swap by setting the INSIGHTFACE_MODEL env var if they've downloaded a
-        # different one. We only need detection, not embeddings/landmarks.
-        import os
-
+        # ``buffalo_l`` is insightface's default pack; override with the
+        # INSIGHTFACE_MODEL env var if you've downloaded a different one. Only
+        # the detection module is loaded (no embeddings/landmarks).
         model_name = os.environ.get("INSIGHTFACE_MODEL", "buffalo_l")
         self._app = FaceAnalysis(
             name=model_name, allowed_modules=["detection"], providers=providers
@@ -148,7 +151,7 @@ class RetinaFaceDetector:
 
         crops: list[FaceCrop] = []
         for f in filtered:
-            x1, y1, x2, y2 = _expand_bbox(
+            x1, y1, x2, y2 = expand_bbox(
                 tuple(f.bbox), self._cfg.face_margin, image.shape
             )
             if x2 <= x1 or y2 <= y1:

@@ -11,6 +11,7 @@ import tempfile
 import threading
 import traceback
 from pathlib import Path
+from typing import Any
 
 from .config import Config, load_config
 from .types import FileResult
@@ -100,10 +101,9 @@ def launch(
         return "**Dataset OK — ready to train.**", _format_stats_md(stats)
 
     # Training runs on a background thread so the UI stays responsive. The
-    # callback writes the latest status line to ``_train_status`` which the
-    # UI polls via a Gradio Timer (gradio 4+). For older Gradio the user
-    # can simply click Refresh.
-    _train_state = {
+    # progress callback writes the latest status line into ``_train_state``;
+    # the "Refresh status" button reads it.
+    _train_state: dict[str, Any] = {
         "status": "Idle.",
         "thread": None,
         "result": None,
@@ -169,10 +169,15 @@ def launch(
                     _train_state["status"] = f"Failed: {e}"
                     _train_state["error"] = traceback.format_exc()
 
-        th = threading.Thread(target=runner, daemon=True)
+        # Check-and-start under one lock acquisition; otherwise two quick
+        # clicks could both pass the "already running?" check above.
         with _state_lock:
+            t = _train_state["thread"]
+            if t is not None and t.is_alive():
+                return "Training already in progress."
+            th = threading.Thread(target=runner, daemon=True)
             _train_state["thread"] = th
-        th.start()
+            th.start()
         return "Training started. Press Refresh to update."
 
     def _train_status_md():

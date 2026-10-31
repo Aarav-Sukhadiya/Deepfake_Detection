@@ -32,7 +32,8 @@ def discover(paths: Iterable[str | Path], cfg: InputConfig) -> list[MediaItem]:
     seen: set[Path] = set()
     items: list[MediaItem] = []
     for raw in paths:
-        root = Path(raw).expanduser()
+        # Absolute roots so ``./a.png`` and ``/abs/a.png`` dedupe together.
+        root = Path(raw).expanduser().absolute()
         for fp in _walk(root, cfg.recursive, cfg.follow_symlinks):
             # ``resolve()`` is one syscall per file and only matters for
             # symlinks (so two distinct paths that point at the same target
@@ -45,12 +46,13 @@ def discover(paths: Iterable[str | Path], cfg: InputConfig) -> list[MediaItem]:
             seen.add(fp)
             try:
                 kind = classify(fp, cfg)
-            except Exception as e:  # noqa: BLE001
-                log.exception("Classify failed for %s", fp)
-                items.append(MediaItem(path=fp, kind=None, size_bytes=0, error=str(e)))  # type: ignore[arg-type]
+                size = fp.stat().st_size if kind is not None else 0
+            except Exception as e:  # noqa: BLE001 - unreadable/vanished file must not abort discovery
+                log.warning("Cannot classify %s: %s", fp, e)
+                items.append(MediaItem(path=fp, kind=None, size_bytes=0, error=str(e)))
                 continue
             if kind is None:
                 log.debug("Skipping unsupported file: %s", fp)
                 continue
-            items.append(MediaItem(path=fp, kind=kind, size_bytes=fp.stat().st_size))
+            items.append(MediaItem(path=fp, kind=kind, size_bytes=size))
     return items

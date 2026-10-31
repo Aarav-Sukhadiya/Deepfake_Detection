@@ -3,17 +3,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 
-class MediaKind(str, Enum):
+class MediaKind(StrEnum):
     IMAGE = "image"
     VIDEO = "video"
 
 
-class Verdict(str, Enum):
+class Verdict(StrEnum):
     REAL = "REAL"
     FAKE = "FAKE"
     UNCERTAIN = "UNCERTAIN"
@@ -24,7 +24,7 @@ class Verdict(str, Enum):
 @dataclass
 class MediaItem:
     path: Path
-    kind: MediaKind
+    kind: MediaKind | None             # None when the file couldn't be classified
     size_bytes: int
     error: str | None = None
 
@@ -83,7 +83,7 @@ class Segment:
 @dataclass
 class FileResult:
     path: Path
-    kind: MediaKind
+    kind: MediaKind | None
     verdict: Verdict
     score: float                       # final aggregated score in [0, 1]
     faces_analyzed: int = 0
@@ -99,7 +99,7 @@ class FileResult:
     def to_dict(self) -> dict:
         return {
             "path": str(self.path),
-            "kind": self.kind.value,
+            "kind": self.kind.value if self.kind else None,
             "verdict": self.verdict.value,
             "score": round(self.score, 4),
             "faces_analyzed": self.faces_analyzed,

@@ -12,17 +12,20 @@ import hashlib
 import json
 import logging
 import os
-from collections.abc import Iterator
+from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
+from .._cache import cache_dir, load_batch_size, save_batch_size
 from ..models.downloader import compute_sha256
+from ..preprocess.face_detect import expand_bbox
 from .constraints import DatasetStats, enforce_constraints, summarise_dataset, walk_media
 
 log = logging.getLogger(__name__)
 
 
-def _config_signature(cfg: "TrainConfig") -> str:
+def _config_signature(cfg: TrainConfig) -> str:
     """Fingerprint the parts of ``cfg`` that, if changed, would invalidate a
     resume — i.e. anything that affects model architecture, dataset, or
     sample selection. ``epochs`` is *intentionally excluded* so a user can
@@ -40,6 +43,7 @@ def _config_signature(cfg: "TrainConfig") -> str:
         "video_fps": cfg.video_fps,
         "max_frames_per_video": cfg.max_frames_per_video,
         "face_detection": cfg.face_detection,
+        "face_margin": cfg.face_margin,
     }
     return hashlib.sha1(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
 
@@ -54,41 +58,13 @@ def _atomic_save_torch(obj, path: Path) -> None:  # pragma: no cover - touches M
     os.replace(tmp, path)
 
 
-def _train_autotune_path() -> Path:
-    base = os.environ.get("DFDETECT_CACHE") or os.path.expanduser("~/.cache/dfdetect")
-    return Path(base) / "autotune_train.json"
+_TRAIN_AUTOTUNE_FILE = "autotune_train.json"
 
 
-def _train_autotune_key(cfg: "TrainConfig", device_name: str) -> str:
+def _train_autotune_key(cfg: TrainConfig, device_name: str) -> str:
     """The OOM-safe batch size depends on backbone, input size, AMP, and GPU
     memory. Same key collides only on identical model/device combos."""
     return f"{cfg.backbone}:224:amp{int(cfg.amp)}:{device_name.replace(' ', '_')}"
-
-
-def _load_train_autotune(key: str) -> int | None:
-    p = _train_autotune_path()
-    if not p.exists():
-        return None
-    try:
-        data = json.loads(p.read_text())
-    except Exception:  # noqa: BLE001
-        return None
-    val = data.get(key)
-    return int(val) if isinstance(val, int) and val >= 1 else None
-
-
-def _save_train_autotune(key: str, batch_size: int) -> None:
-    p = _train_autotune_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        data = json.loads(p.read_text()) if p.exists() else {}
-    except Exception:  # noqa: BLE001
-        data = {}
-    data[key] = int(batch_size)
-    try:
-        p.write_text(json.dumps(data, indent=2))
-    except Exception:  # noqa: BLE001
-        log.debug("Could not persist training-autotune state to %s", p)
 
 
 def _resolve_device(requested: str):  # pragma: no cover - touches ML stack
@@ -130,6 +106,10 @@ class TrainConfig:
     # so we skip detection and just resize. Leaves the inference-time face
     # detector untouched.
     face_detection: bool = True
+    # Context padding around the detected face box, as a fraction of its
+    # size. Must match ``preprocess.face_margin`` at inference (default 0.30)
+    # or the model is evaluated on differently-framed crops than it saw.
+    face_margin: float = 0.30
     # Resume from ``output_dir/resume.pt`` (written after each epoch) when
     # set, allowing Ctrl-C to be safe: re-running the same command picks up
     # from the last completed epoch. Disable for clean-slate retrains.
@@ -145,94 +125,19 @@ class TrainConfig:
     amp: bool = True
 
 
-def _detect_face(rgb, mtcnn):  # pragma: no cover - touches ML stack
-    """Largest face crop from one RGB frame, or ``None`` if MTCNN finds nothing."""
-    box, _ = mtcnn.detect(rgb)
-    if box is None or len(box) == 0:
+def _detect_face_box(rgb, mtcnn, margin: float):  # pragma: no cover - touches ML stack
+    """Margin-expanded box of the largest face in ``rgb``, or ``None``.
+
+    Uses the same :func:`expand_bbox` as the inference detector so training
+    and inference crops are framed identically.
+    """
+    boxes, _ = mtcnn.detect(rgb)
+    if boxes is None or len(boxes) == 0:
         return None
-    x1, y1, x2, y2 = [int(v) for v in box[0]]
+    x1, y1, x2, y2 = expand_bbox(tuple(boxes[0]), margin, rgb.shape)
     if x2 <= x1 or y2 <= y1:
         return None
-    crop = rgb[max(0, y1):y2, max(0, x1):x2]
-    return crop if crop.size > 0 else None
-
-
-def _image_crops(path: Path, mtcnn) -> Iterator:  # pragma: no cover - touches ML stack
-    """Yield the largest face crop from an image, if any.
-
-    When ``mtcnn`` is ``None`` we skip detection and yield the whole image —
-    used for already-face-cropped datasets where the image *is* the crop.
-    """
-    import cv2
-
-    bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
-    if bgr is None:
-        return
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    if mtcnn is None:
-        yield rgb
-        return
-    crop = _detect_face(rgb, mtcnn)
-    if crop is not None:
-        yield crop
-
-
-def _video_crops(  # pragma: no cover - touches ML stack
-    path: Path,
-    mtcnn,
-    fps: float,
-    max_frames: int,
-) -> Iterator:
-    """Yield face crops from sampled frames of a video.
-
-    When ``mtcnn`` is ``None`` we yield each sampled frame as-is (whole-frame
-    training, no detection)."""
-    """Yield one face crop per sampled frame from a video.
-
-    Sampling matches the inference path: every ``round(source_fps / fps)``
-    frames, capped at ``max_frames``. ``decord`` first (fast), OpenCV fallback.
-    """
-    import cv2
-
-    indices: list[int]
-    rgb_frames: list = []
-    try:
-        import decord
-
-        decord.bridge.set_bridge("native")
-        vr = decord.VideoReader(str(path))
-        src_fps = float(vr.get_avg_fps()) or 30.0
-        step = max(1, int(round(src_fps / max(fps, 1e-3))))
-        indices = list(range(0, len(vr), step))[:max_frames]
-        for idx in indices:
-            rgb_frames.append(vr[idx].asnumpy())
-    except Exception:  # noqa: BLE001
-        cap = cv2.VideoCapture(str(path))
-        if not cap.isOpened():
-            return
-        src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        step = max(1, int(round(src_fps / max(fps, 1e-3))))
-        try:
-            i = 0
-            yielded = 0
-            while yielded < max_frames:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-                ok, bgr = cap.read()
-                if not ok:
-                    break
-                rgb_frames.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
-                yielded += 1
-                i += step
-        finally:
-            cap.release()
-
-    for rgb in rgb_frames:
-        if mtcnn is None:
-            yield rgb
-            continue
-        crop = _detect_face(rgb, mtcnn)
-        if crop is not None:
-            yield crop
+    return x1, y1, x2, y2
 
 
 @dataclass
@@ -244,6 +149,58 @@ class _Sample:
     path: Path
     label: int
     frame_index: int | None = None  # ``None`` for still images
+
+    @property
+    def key(self) -> tuple[str, int | None]:
+        return str(self.path), self.frame_index
+
+
+def _source_id(path: Path) -> tuple[int, int] | str:
+    """Identity of the underlying file for train/val splitting.
+
+    ``(st_dev, st_ino)`` so hardlinked duplicates (``scripts/prepare_dfd.py
+    --keep-all-fakes`` oversamples reals this way) count as one source and
+    can't straddle the train/val boundary.
+    """
+    try:
+        st = path.stat()
+        return st.st_dev, st.st_ino
+    except OSError:
+        return str(path)
+
+
+def _group_split(samples: list[_Sample], val_split: float, rng) -> tuple[list[_Sample], list[_Sample]]:
+    """Split by *source file*, not by sample.
+
+    Frames of one video are near-duplicates. A per-frame shuffle puts frames
+    of the same clip in both train and val, so val loss measures memorisation
+    (and can collapse to ~0), which also breaks best-checkpoint selection.
+    """
+    groups: dict[object, list[_Sample]] = {}
+    for smp in samples:
+        groups.setdefault(_source_id(smp.path), []).append(smp)
+    keys = list(groups)
+    rng.shuffle(keys)
+    target = max(1, int(len(samples) * val_split))
+    val: list[_Sample] = []
+    train: list[_Sample] = []
+    for k in keys:
+        # Fill val up to the target without letting one huge group overshoot.
+        if len(val) + len(groups[k]) <= target:
+            val.extend(groups[k])
+        else:
+            train.extend(groups[k])
+    if not val and len(keys) > 1:
+        # Every group is bigger than the target: use the smallest one.
+        smallest = min(keys, key=lambda k: len(groups[k]))
+        val = groups[smallest]
+        train = [smp for k in keys if k != smallest for smp in groups[k]]
+    if not train:  # degenerate: a single source — no honest split possible
+        log.warning("Only one source file; validation overlaps training.")
+        train = val
+    # Keep val ordered by file/frame so the decoder cache gets sequential hits.
+    val.sort(key=lambda smp: (str(smp.path), smp.frame_index or 0))
+    return train, val
 
 
 def _video_frame_indices(  # pragma: no cover - touches ML stack
@@ -318,6 +275,29 @@ def _get_mtcnn():  # pragma: no cover - touches ML stack
     return _mtcnn_singleton
 
 
+# Small LRU of open decord readers. Opening a container (and indexing its
+# keyframes) per frame dominated video decode time; consecutive samples from
+# the same clip (val loader, small datasets) now reuse the reader.
+_READER_CACHE_SIZE = 8
+_reader_cache: OrderedDict[str, object] = OrderedDict()
+
+
+def _decord_reader(path: Path):  # pragma: no cover - touches ML stack
+    import decord
+
+    key = str(path)
+    vr = _reader_cache.get(key)
+    if vr is not None:
+        _reader_cache.move_to_end(key)
+        return vr
+    decord.bridge.set_bridge("native")
+    vr = decord.VideoReader(key)
+    _reader_cache[key] = vr
+    if len(_reader_cache) > _READER_CACHE_SIZE:
+        _reader_cache.popitem(last=False)
+    return vr
+
+
 def _decode_sample_rgb(sample: _Sample):  # pragma: no cover - touches ML stack
     """Return the RGB frame for ``sample`` (image or video frame) or None."""
     import cv2
@@ -330,11 +310,7 @@ def _decode_sample_rgb(sample: _Sample):  # pragma: no cover - touches ML stack
 
     # Video frame — try decord then fall back to OpenCV.
     try:
-        import decord
-
-        decord.bridge.set_bridge("native")
-        vr = decord.VideoReader(str(sample.path))
-        return vr[sample.frame_index].asnumpy()
+        return _decord_reader(sample.path)[sample.frame_index].asnumpy()
     except Exception:  # noqa: BLE001
         cap = cv2.VideoCapture(str(sample.path))
         if not cap.isOpened():
@@ -349,16 +325,22 @@ def _decode_sample_rgb(sample: _Sample):  # pragma: no cover - touches ML stack
             cap.release()
 
 
-def train(cfg: TrainConfig, progress=None) -> Path:  # pragma: no cover - touches ML stack
+def train(
+    cfg: TrainConfig,
+    progress=None,
+    stats: DatasetStats | None = None,
+) -> Path:  # pragma: no cover - touches ML stack
     """Train and write ``cfg.output_dir/model.pt`` plus a ``train.json`` manifest.
 
     Hard anti-bias constraints are enforced *before* any GPU/CPU work so
-    misconfigured folders fail fast. ``progress(phase, done, total, label)``
-    is called repeatedly so the Gradio UI can stream status updates; pass
-    ``None`` for the CLI path. Returns the new checkpoint path.
+    misconfigured folders fail fast. Pass ``stats`` if the caller already ran
+    :func:`enforce_constraints` (saves re-hashing every video).
+    ``progress(phase, done, total, label)`` is called repeatedly so the Gradio
+    UI can stream status updates; pass ``None`` for the CLI path. Returns the
+    new checkpoint path.
     """
-    stats = summarise_dataset(cfg.real_dir, cfg.fake_dir)
-    enforce_constraints(stats)
+    if stats is None:
+        stats = enforce_constraints(summarise_dataset(cfg.real_dir, cfg.fake_dir))
     for warn in stats.warnings:
         log.warning("[training] %s", warn)
 
@@ -371,12 +353,21 @@ def train(cfg: TrainConfig, progress=None) -> Path:  # pragma: no cover - touche
     _MEAN_ARR = np.array((0.485, 0.456, 0.406), dtype=np.float32)
     _STD_ARR = np.array((0.229, 0.224, 0.225), dtype=np.float32)
 
+    # Face boxes per sample, filled on first visit. MTCNN on CPU is the most
+    # expensive per-sample step and its output never changes between epochs,
+    # so later epochs only decode + crop. ``None`` = "no face", which also
+    # lets us skip decoding that sample entirely next time. A few ints per
+    # sample, so this stays small even for 100K-sample sets.
+    _MISSING = object()
+    face_boxes: dict[tuple[str, int | None], tuple[int, int, int, int] | None] = {}
+
     class _LazyCropDataset(Dataset):
         """Decode + (optional) detect + resize + normalise per ``__getitem__``.
 
         Returns ``None`` when face detection fails on a sample; a custom
         ``collate_fn`` filters those out so the DataLoader yields variable-size
-        batches instead of crashing."""
+        batches instead of crashing. Uses ``num_workers=0`` so the box cache
+        above is shared across epochs."""
 
         def __init__(self, samples: list[_Sample], train: bool):
             self.samples = samples
@@ -387,12 +378,21 @@ def train(cfg: TrainConfig, progress=None) -> Path:  # pragma: no cover - touche
 
         def __getitem__(self, idx: int):
             sample = self.samples[idx]
+            box: Any = face_boxes.get(sample.key, _MISSING) if cfg.face_detection else _MISSING
+            if box is None:
+                return None  # known no-face sample: skip the decode too
             rgb = _decode_sample_rgb(sample)
             if rgb is None:
                 return None
             if cfg.face_detection:
-                rgb = _detect_face(rgb, _get_mtcnn())
-                if rgb is None:
+                if box is _MISSING:
+                    box = _detect_face_box(rgb, _get_mtcnn(), cfg.face_margin)
+                    face_boxes[sample.key] = box
+                    if box is None:
+                        return None
+                x1, y1, x2, y2 = box
+                rgb = rgb[y1:y2, x1:x2]
+                if rgb.size == 0:
                     return None
             crop = cv2.resize(rgb, (224, 224), interpolation=cv2.INTER_AREA)
             if self.train and cfg.augment and np.random.rand() < 0.5:
@@ -436,9 +436,7 @@ def train(cfg: TrainConfig, progress=None) -> Path:  # pragma: no cover - touche
         )
 
     rng = np.random.default_rng(cfg.seed)
-    rng.shuffle(samples)
-    val_n = max(1, int(len(samples) * cfg.val_split))
-    val, train_split = samples[:val_n], samples[val_n:]
+    train_split, val = _group_split(samples, cfg.val_split, rng)
 
     # Class-balanced sampler: weight each row by ``1 / class_count`` so a
     # batch is balanced even when one class has more samples than the other.
@@ -485,7 +483,7 @@ def train(cfg: TrainConfig, progress=None) -> Path:  # pragma: no cover - touche
     autotune_key = _train_autotune_key(
         cfg, torch.cuda.get_device_name(device) if use_cuda else "cpu"
     )
-    cached_bs = _load_train_autotune(autotune_key) if use_cuda else None
+    cached_bs = load_batch_size(_TRAIN_AUTOTUNE_FILE, autotune_key) if use_cuda else None
     micro_bs = min(requested_bs, cached_bs) if cached_bs else requested_bs
 
     def _probe(bs: int) -> bool:
@@ -540,10 +538,14 @@ def train(cfg: TrainConfig, progress=None) -> Path:  # pragma: no cover - touche
             torch.cuda.empty_cache()
             return False
 
-    while micro_bs > 1 and not _probe(micro_bs):
+    # Probe each size once: the old ``while ... / if not _probe()`` pair
+    # re-probed the size that had just succeeded (3 extra steps + decodes).
+    fits = _probe(micro_bs)
+    while not fits and micro_bs > 1:
         log.warning("CUDA OOM probing batch_size=%d; halving.", micro_bs)
         micro_bs = max(1, micro_bs // 2)
-    if not _probe(micro_bs):
+        fits = _probe(micro_bs)
+    if not fits:
         # Even bs=1 OOMs — nothing we can do.
         raise RuntimeError(
             f"Even batch_size=1 OOMs on {device}. EfficientNet-B4 needs ~6 GB "
@@ -552,13 +554,13 @@ def train(cfg: TrainConfig, progress=None) -> Path:  # pragma: no cover - touche
 
     grad_accum = max(1, requested_bs // micro_bs)
     if use_cuda:
-        _save_train_autotune(autotune_key, micro_bs)
+        save_batch_size(_TRAIN_AUTOTUNE_FILE, autotune_key, micro_bs)
     if micro_bs != requested_bs:
         log.info(
             "Auto-tuned batch_size: requested=%d, per-step micro_bs=%d, "
             "grad_accum=%d (effective batch=%d). Persisted to %s.",
             requested_bs, micro_bs, grad_accum, micro_bs * grad_accum,
-            _train_autotune_path() if use_cuda else "(not persisted)",
+            cache_dir() / _TRAIN_AUTOTUNE_FILE if use_cuda else "(not persisted)",
         )
 
     def _build_loaders(bs: int):
@@ -591,7 +593,7 @@ def train(cfg: TrainConfig, progress=None) -> Path:  # pragma: no cover - touche
         try:
             # ``map_location=device`` lands all tensors on the training device
             # immediately, so the optimizer state matches the model location.
-            state = torch.load(resume_path, map_location=device)
+            state = torch.load(resume_path, map_location=device, weights_only=True)
         except Exception:  # noqa: BLE001
             log.warning("Resume file %s is unreadable; starting fresh.", resume_path)
             state = None
@@ -627,6 +629,7 @@ def train(cfg: TrainConfig, progress=None) -> Path:  # pragma: no cover - touche
 
     interrupted = False
     last_completed_epoch = start_epoch  # nothing completed yet in *this* run
+
     def _run_epoch(epoch: int) -> None:
         """Run one full epoch (train + val + checkpoint + resume save).
 
@@ -724,12 +727,24 @@ def train(cfg: TrainConfig, progress=None) -> Path:  # pragma: no cover - touche
                     n_val += len(xb)
         finally:
             vbar.close()
-        val_loss /= max(1, n_val)
-        log.info("Epoch %d/%d val_loss=%.4f", epoch + 1, cfg.epochs, val_loss)
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(model.state_dict(), ckpt_path)
-            log.info("Saved new best checkpoint -> %s (val_loss=%.4f)", ckpt_path, val_loss)
+        if n_val == 0:
+            # Previously ``0 / max(1, 0) == 0.0`` was recorded as a perfect
+            # val loss, so no later epoch could ever beat it and model.pt
+            # froze at this epoch. Keep the latest weights instead.
+            log.warning(
+                "Epoch %d/%d: no usable validation samples (face detection failed on "
+                "all of them?). Saving latest weights without model selection.",
+                epoch + 1, cfg.epochs,
+            )
+            _atomic_save_torch(model.state_dict(), ckpt_path)
+            val_loss = float("nan")
+        else:
+            val_loss /= n_val
+            log.info("Epoch %d/%d val_loss=%.4f", epoch + 1, cfg.epochs, val_loss)
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                _atomic_save_torch(model.state_dict(), ckpt_path)
+                log.info("Saved new best checkpoint -> %s (val_loss=%.4f)", ckpt_path, val_loss)
         if progress is not None:
             progress("train", epoch + 1, cfg.epochs, f"val_loss={val_loss:.4f}")
 
@@ -765,7 +780,7 @@ def train(cfg: TrainConfig, progress=None) -> Path:  # pragma: no cover - touche
                     torch.cuda.empty_cache()
                     micro_bs = max(1, micro_bs // 2)
                     grad_accum = max(1, requested_bs // micro_bs)
-                    _save_train_autotune(autotune_key, micro_bs)
+                    save_batch_size(_TRAIN_AUTOTUNE_FILE, autotune_key, micro_bs)
                     train_loader, val_loader = _build_loaders(micro_bs)
                     opt.zero_grad(set_to_none=True)
     except KeyboardInterrupt:
@@ -785,7 +800,11 @@ def train(cfg: TrainConfig, progress=None) -> Path:  # pragma: no cover - touche
         "learning_rate": cfg.learning_rate,
         "batch_size": cfg.batch_size,
         "val_split": cfg.val_split,
-        "best_val_loss": best_val_loss,
+        "face_margin": cfg.face_margin,
+        "train_samples": len(train_split),
+        "val_samples": len(val),
+        # JSON has no Infinity; ``None`` means "never measured".
+        "best_val_loss": best_val_loss if best_val_loss != float("inf") else None,
         "interrupted": interrupted,
         "stats": asdict(stats),
         "ckpt_sha256": compute_sha256(ckpt_path) if ckpt_path.exists() else None,

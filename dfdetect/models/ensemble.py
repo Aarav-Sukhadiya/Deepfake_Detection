@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
+
 from .base import DeepfakeModel
 
 
@@ -43,18 +45,16 @@ class EnsembleModel(DeepfakeModel):
         faces = batch
         if not faces:
             return []
-        accum: list[float] = [0.0] * len(faces)
+        accum = np.zeros(len(faces), dtype=np.float64)
         for member, weight in self._members:
-            member_batch = member.preprocess(faces)
-            member_scores = member.predict(member_batch)
+            member_scores = member.predict(member.preprocess(faces))
             if len(member_scores) != len(faces):
                 raise RuntimeError(
                     f"Ensemble member {member.name} returned {len(member_scores)} "
                     f"scores for {len(faces)} faces."
                 )
-            for i, s in enumerate(member_scores):
-                accum[i] += weight * s
-        return accum
+            accum += weight * np.asarray(member_scores, dtype=np.float64)
+        return accum.tolist()
 
     def grad_cam_target_layer(self) -> Any:
         return self._members[0][0].grad_cam_target_layer()
@@ -62,6 +62,9 @@ class EnsembleModel(DeepfakeModel):
     def grad_cam_model(self) -> Any:
         # CAM operates on a single torch module; defer to the first member.
         return self._members[0][0].grad_cam_model()
+
+    def grad_cam_preprocess(self, faces: list[Any]) -> Any:
+        return self._members[0][0].grad_cam_preprocess(faces)
 
     def hash(self) -> str:
         parts = [m.hash() for m, _ in self._members]

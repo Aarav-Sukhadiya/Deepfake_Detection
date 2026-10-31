@@ -6,46 +6,29 @@ instead of repeating the OOM-and-halve dance every run.
 """
 from __future__ import annotations
 
-import json
 import logging
-import os
-from pathlib import Path
 
+from .._cache import load_batch_size, save_batch_size
 from ..models.base import DeepfakeModel
 from ..types import FaceCrop
 
 log = logging.getLogger(__name__)
 
-
-def _autotune_path() -> Path:
-    base = os.environ.get("DFDETECT_CACHE") or os.path.expanduser("~/.cache/dfdetect")
-    return Path(base) / "autotune.json"
+_AUTOTUNE_FILE = "autotune.json"
 
 
-def _load_autotune(model_key: str) -> int | None:
-    p = _autotune_path()
-    if not p.exists():
-        return None
+def _is_oom(exc: BaseException) -> bool:
+    return "out of memory" in str(exc).lower()
+
+
+def _free_cuda_cache() -> None:
     try:
-        data = json.loads(p.read_text())
-    except Exception:  # noqa: BLE001
-        return None
-    val = data.get(model_key)
-    return int(val) if isinstance(val, int) and val >= 1 else None
+        import torch
 
-
-def _save_autotune(model_key: str, batch_size: int) -> None:
-    p = _autotune_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        data = json.loads(p.read_text()) if p.exists() else {}
-    except Exception:  # noqa: BLE001
-        data = {}
-    data[model_key] = int(batch_size)
-    try:
-        p.write_text(json.dumps(data, indent=2))
-    except Exception:  # noqa: BLE001
-        log.debug("Could not persist autotune state to %s", p)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001 - best effort
+        pass
 
 
 class InferenceRunner:
@@ -60,7 +43,7 @@ class InferenceRunner:
         self.autotune = autotune
         self._key = f"{model.name}:{model.hash()}"
         if autotune:
-            cached = _load_autotune(self._key)
+            cached = load_batch_size(_AUTOTUNE_FILE, self._key)
             if cached is not None and cached < batch_size:
                 log.info(
                     "Autotune: starting batch_size=%d for %s (cached from a prior OOM).",
@@ -78,22 +61,22 @@ class InferenceRunner:
         i = 0
         while i < len(faces):
             chunk = faces[i : i + bs]
+            oom = False
             try:
-                batch = self.model.preprocess([f.image for f in chunk])
-                scores.extend(self.model.predict(batch))
-                i += bs
-            except RuntimeError as e:
-                if "out of memory" in str(e).lower() and bs > 1:
-                    new_bs = max(1, bs // 2)
-                    log.warning("CUDA OOM at batch=%d; halving to %d and retrying.", bs, new_bs)
-                    bs = new_bs
-                    if self.autotune:
-                        _save_autotune(self._key, bs)
-                    continue
-                raise
-        # Persist the successful batch size so future runs skip the halving
-        # dance, even if it stayed at the originally-requested size.
+                scores.extend(self.model.predict(self.model.preprocess([f.image for f in chunk])))
+            except RuntimeError as e:  # torch.cuda.OutOfMemoryError subclasses RuntimeError
+                if not _is_oom(e) or bs <= 1:
+                    raise
+                oom = True
+            if oom:
+                # Freed outside the ``except`` so the traceback (and the
+                # tensors its frames reference) has already been released.
+                _free_cuda_cache()
+                bs = max(1, bs // 2)
+                log.warning("CUDA OOM; halving batch size to %d and retrying.", bs)
+                continue
+            i += len(chunk)
         if self.autotune and bs != self.batch_size:
-            _save_autotune(self._key, bs)
+            save_batch_size(_AUTOTUNE_FILE, self._key, bs)
         self.batch_size = bs
         return scores

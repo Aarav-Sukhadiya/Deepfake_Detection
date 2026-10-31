@@ -12,7 +12,7 @@ into calibrated ones. Two stages, applied in order:
    temperature alone leaves residual miscalibration.
 
 Calibrated models keep ``hash()`` of the wrapped model so the run identifier
-stays tied to the underlying weights, with a ``+cal:`` suffix marking that
+stays tied to the underlying weights, with a ``+cal`` suffix marking that
 calibration is active.
 """
 from __future__ import annotations
@@ -115,6 +115,9 @@ class CalibratedModel(DeepfakeModel):
 
     def grad_cam_model(self) -> Any:
         return self._inner.grad_cam_model()
+
+    def grad_cam_preprocess(self, faces: list[Any]) -> Any:
+        return self._inner.grad_cam_preprocess(faces)
 
     def hash(self) -> str:
         return f"{self._inner.hash()}+cal"

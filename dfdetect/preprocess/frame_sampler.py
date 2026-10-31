@@ -13,7 +13,7 @@ Video sampling supports three strategies (``VideoConfig.sampling_strategy``):
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import numpy as np
@@ -23,11 +23,19 @@ from ..config import VideoConfig
 
 log = logging.getLogger(__name__)
 
+# Frames decoded per ``VideoReader.get_batch`` call. Batching amortises
+# decord's per-call seek overhead; 16 1080p frames is ~100 MB, a safe cap.
+_DECORD_BATCH = 16
+# OpenCV: below this forward distance, ``grab()``-ing through frames is cheaper
+# than a keyframe seek via ``CAP_PROP_POS_FRAMES``.
+_CV_MAX_GRAB_AHEAD = 64
+
 
 def sample_image(path: Path) -> np.ndarray:
     """Decode an image file as RGB uint8."""
-    img = Image.open(path).convert("RGB")
-    return np.array(img)
+    with Image.open(path) as img:
+        # ``np.array`` (not ``asarray``) so the result is writable.
+        return np.array(img.convert("RGB"))
 
 
 # --- Scene detection -----------------------------------------------------
@@ -70,35 +78,17 @@ def detect_scene_boundaries(
     return boundaries
 
 
-def _scene_indices(
-    decoded: list[tuple[int, np.ndarray]],
-    cfg: VideoConfig,
-) -> list[int]:
-    """Pick decoded-frame indices that lie on a scene boundary.
-
-    ``decoded`` is a list of ``(frame_index_in_source, frame_rgb)`` pairs
-    already downsampled to the scene-detector stride. Returns the subset of
-    source frame indices to actually pass into the model.
-    """
-    histograms = [_hsv_histogram(f, cfg.scene_thumb_size) for _, f in decoded]
-    boundary_positions = detect_scene_boundaries(histograms, cfg.scene_threshold)
-    return [decoded[p][0] for p in boundary_positions]
-
-
 # --- Video sampling ------------------------------------------------------
 
-def _open_video_decord(path: Path):
-    import decord  # lazy
-
-    decord.bridge.set_bridge("native")
-    return decord.VideoReader(str(path))
+def _uniform_step(fps: float, cfg: VideoConfig) -> int:
+    return max(1, int(round(fps / cfg.frames_per_second)))
 
 
 def _plan_indices(
     total: int,
     fps: float,
     cfg: VideoConfig,
-    fetch_frame,
+    fetch_frame: Callable[[int], np.ndarray],
 ) -> list[int]:
     """Decide which source-frame indices to actually decode + return.
 
@@ -106,92 +96,125 @@ def _plan_indices(
     function works for both decord and OpenCV. ``total`` is the source frame
     count; ``fps`` the average frame rate.
     """
-    uniform_step = max(1, int(round(fps / cfg.frames_per_second)))
-    uniform_indices = list(range(0, total, uniform_step))
+    uniform_step = _uniform_step(fps, cfg)
+    uniform_indices = range(0, total, uniform_step)
 
     if cfg.sampling_strategy == "uniform":
-        return uniform_indices[: cfg.max_frames]
+        return list(uniform_indices[: cfg.max_frames])
 
     # Scene-detector stride: sample more densely than the uniform schedule so
     # we don't miss short cuts. ``scene_stride=0`` defers to the uniform step.
-    stride = cfg.scene_stride or uniform_step
-    stride = max(1, stride)
-    probe_indices = list(range(0, total, stride))
-    decoded: list[tuple[int, np.ndarray]] = []
-    for idx in probe_indices:
+    stride = max(1, cfg.scene_stride or uniform_step)
+    # Only the thumbnail histogram of each probe frame is kept, so memory
+    # stays O(probes × 1 KB) rather than O(probes × full frame).
+    probed: list[int] = []
+    histograms: list[np.ndarray] = []
+    for idx in range(0, total, stride):
         try:
             frame = fetch_frame(idx)
         except Exception as e:  # noqa: BLE001
             log.debug("scene-probe decode failed at idx=%d: %s", idx, e)
             continue
-        decoded.append((idx, frame))
-    scene_indices = _scene_indices(decoded, cfg)
+        probed.append(idx)
+        histograms.append(_hsv_histogram(frame, cfg.scene_thumb_size))
+    scene_indices = [probed[p] for p in detect_scene_boundaries(histograms, cfg.scene_threshold)]
 
     if cfg.sampling_strategy == "scene":
         return scene_indices[: cfg.max_frames]
 
     # Hybrid: uniform + scene, deduped, sorted, capped.
-    merged = sorted(set(uniform_indices) | set(scene_indices))
-    return merged[: cfg.max_frames]
+    return sorted(set(uniform_indices) | set(scene_indices))[: cfg.max_frames]
 
 
-def sample_video(path: Path, cfg: VideoConfig) -> Iterator[tuple[int, float, np.ndarray]]:
-    """Yield (frame_index, timestamp_s, RGB frame) for sampled frames.
-
-    Decoder priority: decord (fast) → OpenCV (fallback). The sampling schedule
-    is decided by ``cfg.sampling_strategy``; ``max_frames`` is a hard cap.
-    """
+def _sample_decord(path: Path, cfg: VideoConfig) -> Iterator[tuple[int, float, np.ndarray]] | None:
+    """Return a frame iterator backed by decord, or ``None`` if decord can't
+    open/plan this file (so the caller can fall back to OpenCV *before*
+    anything has been yielded)."""
     try:
-        vr = _open_video_decord(path)
-        fps = float(vr.get_avg_fps()) or 30.0
-        total = len(vr)
-        indices = _plan_indices(total, fps, cfg, fetch_frame=lambda i: vr[i].asnumpy())
-        for idx in indices:
-            frame = vr[idx].asnumpy()
-            yield idx, idx / fps, frame
-        return
-    except Exception as e:  # noqa: BLE001
-        log.debug("decord failed (%s); falling back to OpenCV", e)
+        import decord  # lazy
 
+        decord.bridge.set_bridge("native")
+        vr = decord.VideoReader(str(path))
+        fps = float(vr.get_avg_fps()) or 30.0
+        indices = _plan_indices(len(vr), fps, cfg, fetch_frame=lambda i: vr[i].asnumpy())
+    except Exception as e:  # noqa: BLE001
+        log.debug("decord failed for %s (%s); falling back to OpenCV", path, e)
+        return None
+
+    def gen() -> Iterator[tuple[int, float, np.ndarray]]:
+        for start in range(0, len(indices), _DECORD_BATCH):
+            chunk = indices[start : start + _DECORD_BATCH]
+            try:
+                frames = vr.get_batch(chunk).asnumpy()
+            except Exception as e:  # noqa: BLE001
+                log.debug("decord batch decode failed at %s: %s", chunk, e)
+                continue
+            for idx, frame in zip(chunk, frames, strict=True):
+                yield idx, idx / fps, frame
+
+    return gen()
+
+
+def _sample_opencv(path: Path, cfg: VideoConfig) -> Iterator[tuple[int, float, np.ndarray]]:
     import cv2  # lazy
 
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {path}")
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-
-    def _fetch_cv(idx: int) -> np.ndarray:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ok, frame_bgr = cap.read()
-        if not ok:
-            raise RuntimeError(f"cv2 read failed at frame {idx}")
-        return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-
     try:
-        if total <= 0:
-            # Old containers sometimes lie about frame count; fall back to the
-            # legacy linear walk so we still produce *something*.
-            step = max(1, int(round(fps / cfg.frames_per_second)))
-            yielded = 0
-            idx = 0
-            while yielded < cfg.max_frames:
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        pos = 0  # index of the frame the next ``read()`` returns
+
+        def fetch(idx: int) -> np.ndarray:
+            nonlocal pos
+            ahead = idx - pos
+            if ahead < 0 or ahead > _CV_MAX_GRAB_AHEAD:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-                ok, frame_bgr = cap.read()
-                if not ok:
+            else:
+                for _ in range(ahead):
+                    if not cap.grab():
+                        break
+            ok, frame_bgr = cap.read()
+            if not ok:
+                pos = idx  # unknown position after a failed read; force a seek next time
+                raise RuntimeError(f"cv2 read failed at frame {idx}")
+            pos = idx + 1
+            return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+        if total <= 0:
+            # Some containers don't report a frame count; walk forward at the
+            # uniform step until the stream ends.
+            step = _uniform_step(fps, cfg)
+            for n in range(cfg.max_frames):
+                idx = n * step
+                try:
+                    frame = fetch(idx)
+                except RuntimeError:
                     break
-                yield idx, idx / fps, cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                yielded += 1
-                idx += step
+                yield idx, idx / fps, frame
             return
 
-        indices = _plan_indices(total, fps, cfg, fetch_frame=_fetch_cv)
-        for idx in indices:
+        for idx in _plan_indices(total, fps, cfg, fetch_frame=fetch):
             try:
-                frame_rgb = _fetch_cv(idx)
-            except Exception as e:  # noqa: BLE001
+                frame = fetch(idx)
+            except RuntimeError as e:
                 log.debug("cv2 sample-decode failed at idx=%d: %s", idx, e)
                 continue
-            yield idx, idx / fps, frame_rgb
+            yield idx, idx / fps, frame
     finally:
         cap.release()
+
+
+def sample_video(path: Path, cfg: VideoConfig) -> Iterator[tuple[int, float, np.ndarray]]:
+    """Yield (frame_index, timestamp_s, RGB frame) for sampled frames.
+
+    Decoder priority: decord (fast) → OpenCV (fallback). The fallback only
+    happens if decord can't open the file; a decode error mid-stream skips
+    that chunk instead of restarting from frame 0 with another backend (which
+    would yield duplicate frames). ``max_frames`` is a hard cap.
+    """
+    frames = _sample_decord(path, cfg)
+    if frames is None:
+        frames = _sample_opencv(path, cfg)
+    yield from frames

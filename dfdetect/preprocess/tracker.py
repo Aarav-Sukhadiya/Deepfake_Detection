@@ -14,8 +14,8 @@ single frame are tolerated via a small ``max_gap`` lookback.
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Iterable
 
 from ..types import FaceCrop
 
@@ -68,27 +68,35 @@ def assign_tracks(
         open_tracks = [t for t in open_tracks if frame_idx - t.last_frame <= max_gap_frames]
         frame_faces = by_frame[frame_idx]
 
-        # Greedy match: for each face, pick the best-IoU open track that's
-        # still unclaimed this frame.
-        claimed: set[int] = set()
-        for f in frame_faces:
-            best_track: _Track | None = None
-            best_iou = iou_threshold
-            for t in open_tracks:
-                if t.track_id in claimed:
-                    continue
-                score = _iou(f.bbox, t.last_bbox)
-                if score > best_iou:
-                    best_iou = score
-                    best_track = t
-            if best_track is None:
-                best_track = _Track(track_id=next_id, last_bbox=f.bbox, last_frame=frame_idx)
+        # Greedy *global* match: consider every (face, track) pair above the
+        # threshold, best IoU first, so detection order can't let one face
+        # steal a track that fits another face better.
+        pairs = sorted(
+            (
+                (iou, fi, ti)
+                for fi, f in enumerate(frame_faces)
+                for ti, t in enumerate(open_tracks)
+                if (iou := _iou(f.bbox, t.last_bbox)) > iou_threshold
+            ),
+            reverse=True,
+        )
+        assignment: dict[int, _Track] = {}
+        used_tracks: set[int] = set()
+        for _, fi, ti in pairs:
+            if fi in assignment or ti in used_tracks:
+                continue
+            assignment[fi] = open_tracks[ti]
+            used_tracks.add(ti)
+
+        for fi, f in enumerate(frame_faces):
+            track = assignment.get(fi)
+            if track is None:
+                track = _Track(track_id=next_id, last_bbox=f.bbox, last_frame=frame_idx)
                 next_id += 1
-                open_tracks.append(best_track)
-            best_track.last_bbox = f.bbox
-            best_track.last_frame = frame_idx
-            best_track.faces.append(f)
-            claimed.add(best_track.track_id)
-            f.track_id = best_track.track_id
+                open_tracks.append(track)
+            track.last_bbox = f.bbox
+            track.last_frame = frame_idx
+            track.faces.append(f)
+            f.track_id = track.track_id
             out.append(f)
     return out

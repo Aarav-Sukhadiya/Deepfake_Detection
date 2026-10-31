@@ -6,8 +6,8 @@ import pytest
 
 cv2 = pytest.importorskip("cv2")
 
-from dfdetect.config import VideoConfig
-from dfdetect.preprocess.frame_sampler import (
+from dfdetect.config import VideoConfig  # noqa: E402
+from dfdetect.preprocess.frame_sampler import (  # noqa: E402
     _hsv_histogram,
     _plan_indices,
     detect_scene_boundaries,

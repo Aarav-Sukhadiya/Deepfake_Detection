@@ -15,11 +15,11 @@ Today this module exposes the shape so callers can stub out integration.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 
 
-class TrustLevel(str, Enum):
+class TrustLevel(StrEnum):
     UNSIGNED = "unsigned"
     VERIFIED = "verified"
     TAMPERED = "tampered"

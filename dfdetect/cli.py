@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional
 
 import typer
 from rich.console import Console
@@ -29,9 +28,15 @@ app = typer.Typer(
 console = Console()
 
 
+_OUTPUT_FORMATS = ("json", "csv", "html")
+
+
 def _setup_logging(level: str) -> None:
+    resolved = logging.getLevelName(level.upper())
+    if not isinstance(resolved, int):
+        raise typer.BadParameter(f"Unknown log level: {level}", param_hint="--log-level")
     logging.basicConfig(
-        level=level,
+        level=resolved,
         format="%(message)s",
         datefmt="[%X]",
         handlers=[RichHandler(console=console, show_path=False, markup=True)],
@@ -66,23 +71,36 @@ def _summary_table(results: list[FileResult]) -> Table:
     return t
 
 
+def _load(config: Path | None) -> Config:
+    try:
+        return load_config(config)
+    except (FileNotFoundError, ValueError) as e:  # pydantic ValidationError is a ValueError
+        raise typer.BadParameter(str(e), param_hint="--config") from e
+
+
 def _apply_overrides(
     cfg: Config,
-    threshold: Optional[float],
-    gpu: Optional[bool],
-    fps: Optional[float],
-    batch_size: Optional[int],
-    heatmaps: Optional[bool],
+    threshold: float | None,
+    gpu: bool | None,
+    fps: float | None,
+    batch_size: int | None,
+    heatmaps: bool | None,
 ) -> Config:
     if threshold is not None:
+        if not 0.0 <= threshold <= 1.0:
+            raise typer.BadParameter("must be in [0, 1]", param_hint="--threshold")
         cfg.threshold = threshold
     if gpu is True:
         cfg.device = "cuda"
     if gpu is False:
         cfg.device = "cpu"
     if fps is not None:
+        if fps <= 0:
+            raise typer.BadParameter("must be > 0", param_hint="--frames-per-second")
         cfg.video.frames_per_second = fps
     if batch_size is not None:
+        if batch_size < 1:
+            raise typer.BadParameter("must be >= 1", param_hint="--batch-size")
         cfg.batch_size = batch_size
     if heatmaps is not None:
         cfg.report.heatmaps = heatmaps
@@ -92,15 +110,19 @@ def _apply_overrides(
 @app.command()
 def analyze(
     paths: list[Path] = typer.Argument(..., help="Files or directories to analyze."),
-    config: Optional[Path] = typer.Option(None, "--config", "-c", help="YAML config path."),
-    output: str = typer.Option("json", "--output", "-o", help="Output format: json | csv | html"),
-    output_dir: Path = typer.Option(Path("./reports"), "--output-dir", help="Where to write reports."),
-    threshold: Optional[float] = typer.Option(None, "--threshold", "-t"),
-    recursive: bool = typer.Option(False, "--recursive", "-r"),
-    gpu: Optional[bool] = typer.Option(None, "--gpu/--cpu", help="Force device."),
-    fps: Optional[float] = typer.Option(None, "--frames-per-second", "-f"),
-    batch_size: Optional[int] = typer.Option(None, "--batch-size", "-b"),
-    heatmaps: bool = typer.Option(False, "--heatmaps/--no-heatmaps"),
+    config: Path | None = typer.Option(None, "--config", "-c", help="YAML config path."),
+    output: str | None = typer.Option(
+        None, "--output", "-o", help="Output format: json | csv | html (default: config report.default_format)."
+    ),
+    output_dir: Path | None = typer.Option(
+        None, "--output-dir", help="Where to write reports (default: config report.output_dir)."
+    ),
+    threshold: float | None = typer.Option(None, "--threshold", "-t"),
+    recursive: bool | None = typer.Option(None, "--recursive/--no-recursive", "-r"),
+    gpu: bool | None = typer.Option(None, "--gpu/--cpu", help="Force device."),
+    fps: float | None = typer.Option(None, "--frames-per-second", "-f"),
+    batch_size: int | None = typer.Option(None, "--batch-size", "-b"),
+    heatmaps: bool | None = typer.Option(None, "--heatmaps/--no-heatmaps"),
     model_card: bool = typer.Option(
         False, "--model-card/--no-model-card",
         help="Render a model-card markdown alongside the report.",
@@ -109,10 +131,20 @@ def analyze(
 ):
     """Analyze the given paths and write a report."""
     _setup_logging(log_level)
-    cfg = load_config(config)
-    cfg.input.recursive = recursive
-    cfg.report.output_dir = output_dir
+    cfg = _load(config)
+    # CLI flags override the config only when actually passed.
+    if recursive is not None:
+        cfg.input.recursive = recursive
+    if output_dir is not None:
+        cfg.report.output_dir = output_dir
     cfg = _apply_overrides(cfg, threshold, gpu, fps, batch_size, heatmaps)
+    output = (output or cfg.report.default_format).lower()
+    # Validate before the (potentially hours-long) analysis, not after.
+    if output not in _OUTPUT_FORMATS:
+        raise typer.BadParameter(
+            f"Unknown output format {output!r}; choose from {', '.join(_OUTPUT_FORMATS)}.",
+            param_hint="--output",
+        )
 
     # Defer heavy imports until after we've parsed CLI args.
     from .pipeline import Pipeline
@@ -143,15 +175,13 @@ def analyze(
         write_json(results, out_path)
     elif output == "csv":
         write_csv(results, out_path)
-    elif output == "html":
+    else:
         write_html(
             results,
             out_path,
             threshold=cfg.threshold,
             uncertain_band=cfg.uncertain_band,
         )
-    else:
-        raise typer.BadParameter(f"Unknown output format: {output}")
     console.print(f"Wrote [cyan]{out_path}[/cyan]")
 
     if model_card:
@@ -163,7 +193,7 @@ def analyze(
 
 @app.command()
 def ui(
-    config: Optional[Path] = typer.Option(None, "--config", "-c"),
+    config: Path | None = typer.Option(None, "--config", "-c"),
     host: str = typer.Option("127.0.0.1", "--host"),
     port: int = typer.Option(7860, "--port"),
     share: bool = typer.Option(False, "--share"),
@@ -177,11 +207,11 @@ def ui(
 
 @app.command()
 def runs(
-    config: Optional[Path] = typer.Option(None, "--config", "-c"),
+    config: Path | None = typer.Option(None, "--config", "-c"),
     limit: int = typer.Option(20, "--limit"),
 ):
     """List recent analysis runs from the local SQLite store."""
-    cfg = load_config(config)
+    cfg = _load(config)
     from .storage.db import ResultsStore
     store = ResultsStore(cfg.storage.db_path)
     rows = store.list_runs(limit=limit)
@@ -191,25 +221,31 @@ def runs(
     t.add_column("Model")
     t.add_column("Hash")
     t.add_column("Files", justify="right")
+    t.add_column("Kind")
     for r in rows:
-        t.add_row(str(r["id"]), r["started_at"], r["model_name"], r["model_hash"], str(r["n_results"]))
+        kind = r["kind"] if r["parent_run_id"] is None else f'{r["kind"]} (of {r["parent_run_id"]})'
+        t.add_row(
+            str(r["id"]), r["started_at"], r["model_name"], r["model_hash"], str(r["n_results"]), kind
+        )
     console.print(t)
 
 
 @app.command("reverdict")
 def reverdict(
     run_id: int = typer.Argument(..., help="Run ID from `dfdetect runs`."),
-    threshold: float = typer.Option(0.5, "--threshold", "-t"),
-    uncertain_lo: Optional[float] = typer.Option(
+    threshold: float | None = typer.Option(
+        None, "--threshold", "-t", help="New threshold (default: config threshold)."
+    ),
+    uncertain_lo: float | None = typer.Option(
         None, "--uncertain-lo", help="Override uncertain-band lower bound."
     ),
-    uncertain_hi: Optional[float] = typer.Option(
+    uncertain_hi: float | None = typer.Option(
         None, "--uncertain-hi", help="Override uncertain-band upper bound."
     ),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Print updated verdicts without writing a derived run."
     ),
-    config: Optional[Path] = typer.Option(None, "--config", "-c"),
+    config: Path | None = typer.Option(None, "--config", "-c"),
 ):
     """Re-apply a different threshold to an existing run without re-running inference.
 
@@ -217,10 +253,14 @@ def reverdict(
     ``parent_run_id``, so the new verdicts are queryable later. Use ``--dry-run``
     to preview without writing.
     """
-    cfg = load_config(config)
-    from .inference.aggregator import verdict_from_score
+    cfg = _load(config)
+    from .inference.aggregator import reverdict as apply_verdict
     from .storage.db import ResultsStore
 
+    if threshold is None:
+        threshold = cfg.threshold
+    if not 0.0 <= threshold <= 1.0:
+        raise typer.BadParameter("must be in [0, 1]", param_hint="--threshold")
     lo = uncertain_lo if uncertain_lo is not None else cfg.uncertain_band[0]
     hi = uncertain_hi if uncertain_hi is not None else cfg.uncertain_band[1]
     if not (0.0 <= lo <= hi <= 1.0):
@@ -234,7 +274,7 @@ def reverdict(
         console.print(f"[yellow]No results found for run {run_id}.[/]")
         return
     for r in results:
-        r.verdict = verdict_from_score(r.score, threshold, (lo, hi), r.faces_analyzed)
+        r.verdict = apply_verdict(r, threshold, (lo, hi))
     console.print(_summary_table(results))
 
     if dry_run:
@@ -304,10 +344,13 @@ def train_cmd(
     training. Use ``--check-only`` to validate a dataset without training.
     """
     _setup_logging(log_level)
-    from .training import enforce_constraints, summarise_dataset
+    from .training import BiasConstraintError, enforce_constraints, summarise_dataset
 
-    stats = summarise_dataset(real_dir, fake_dir)
-    enforce_constraints(stats)
+    try:
+        stats = enforce_constraints(summarise_dataset(real_dir, fake_dir))
+    except BiasConstraintError as e:
+        console.print(f"[red]Cannot train:[/] {e}")
+        raise typer.Exit(code=1) from e
     console.print(
         f"[green]Dataset OK[/]: real={stats.real_count}, fake={stats.fake_count} "
         f"(ratio={stats.fake_ratio:.2f})"
@@ -334,27 +377,34 @@ def train_cmd(
             resume=resume,
             device=device,
             amp=amp,
-        )
+        ),
+        stats=stats,  # already validated above; skip re-hashing every video
     )
     console.print(f"Wrote checkpoint [cyan]{ckpt}[/]")
 
 
 @app.command("query")
 def query_cmd(
-    run_id: Optional[int] = typer.Option(None, "--run", help="Filter by run id."),
-    verdict: Optional[str] = typer.Option(
+    run_id: int | None = typer.Option(None, "--run", help="Filter by run id."),
+    verdict: str | None = typer.Option(
         None, "--verdict", help="Filter by verdict (REAL/FAKE/UNCERTAIN/NO_FACE/ERROR)."
     ),
-    path_glob: Optional[str] = typer.Option(
+    path_glob: str | None = typer.Option(
         None, "--path", help="SQL LIKE pattern matched against the stored path (use %% as wildcard)."
     ),
-    min_score: Optional[float] = typer.Option(None, "--min-score"),
-    max_score: Optional[float] = typer.Option(None, "--max-score"),
+    min_score: float | None = typer.Option(None, "--min-score"),
+    max_score: float | None = typer.Option(None, "--max-score"),
     limit: int = typer.Option(200, "--limit"),
-    config: Optional[Path] = typer.Option(None, "--config", "-c"),
+    config: Path | None = typer.Option(None, "--config", "-c"),
 ):
     """Filter persisted results without re-running inference."""
-    cfg = load_config(config)
+    cfg = _load(config)
+    if verdict is not None:
+        verdict = verdict.upper()
+        if verdict not in Verdict.__members__:
+            raise typer.BadParameter(
+                f"choose from {', '.join(Verdict.__members__)}", param_hint="--verdict"
+            )
     from .storage.db import ResultsStore
     store = ResultsStore(cfg.storage.db_path)
     results = store.query(

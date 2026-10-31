@@ -26,8 +26,9 @@ class PreprocessConfig(BaseModel):
 
 
 class VideoConfig(BaseModel):
-    frames_per_second: float = 1.0
-    max_frames: int = 64
+    # ``gt=0``: frames_per_second is a divisor in the sampling step.
+    frames_per_second: float = Field(default=1.0, gt=0)
+    max_frames: int = Field(default=64, ge=1)
     sampling_strategy: Literal["uniform", "scene", "hybrid"] = "uniform"
     # Lower = stricter (more boundaries flagged). HSV-histogram correlation
     # between consecutive thumbnails; values below this fire a boundary.
@@ -129,10 +130,10 @@ class LoggingConfig(BaseModel):
 class PipelineConfig(BaseModel):
     # Number of threads used to pre-extract face crops while the model is
     # running on the previous file. 0 = single-threaded (today's behaviour).
-    workers: int = 0
+    workers: int = Field(default=0, ge=0)
     # Bound the in-flight queue so we don't fan out arbitrarily many files
     # when preprocessing is much faster than inference.
-    prefetch: int = 2
+    prefetch: int = Field(default=2, ge=1)
 
 
 class Config(BaseModel):
@@ -179,10 +180,22 @@ class Config(BaseModel):
 
 
 def load_config(path: str | Path | None = None) -> Config:
-    """Load configuration from a YAML file, falling back to packaged defaults."""
-    target = Path(path) if path else DEFAULT_CONFIG_PATH
-    if not target.exists():
-        return Config()
-    with open(target) as f:
+    """Load configuration from a YAML file, falling back to packaged defaults.
+
+    An explicitly requested ``path`` must exist — a typo in ``--config`` should
+    fail loudly rather than run with defaults the user never asked for. Only
+    the implicit default file is optional (it isn't shipped inside wheels).
+    """
+    if path:
+        target = Path(path).expanduser()
+        if not target.is_file():
+            raise FileNotFoundError(f"Config file not found: {target}")
+    else:
+        target = DEFAULT_CONFIG_PATH
+        if not target.is_file():
+            return Config()
+    with open(target, encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{target}: top level must be a mapping, got {type(data).__name__}")
     return Config(**data)

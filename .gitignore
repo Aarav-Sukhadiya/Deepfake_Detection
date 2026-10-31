@@ -1,5 +1,6 @@
 /.claude
 /IMPROVEMENTS.md
+/graphify-out/
 
 # Model checkpoints (too large for GitHub)
 /checkpoints/

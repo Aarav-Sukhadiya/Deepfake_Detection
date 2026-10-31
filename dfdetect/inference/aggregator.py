@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from ..config import InferenceConfig
-from ..types import FrameScore, Segment, Verdict
+from ..types import FileResult, FrameScore, Segment, Verdict
 
 
 def _mean(xs: Sequence[float]) -> float:
@@ -55,7 +55,7 @@ def aggregate(
             return _mean(scores)
         total_w = 0.0
         weighted_sum = 0.0
-        for s, wt in zip(scores, weights):
+        for s, wt in zip(scores, weights, strict=True):
             weighted_sum += s * wt
             total_w += wt
         if total_w <= 0:
@@ -76,6 +76,22 @@ def verdict_from_score(
     if lo <= score <= hi:
         return Verdict.UNCERTAIN
     return Verdict.FAKE if score >= threshold else Verdict.REAL
+
+
+def reverdict(
+    result: FileResult,
+    threshold: float,
+    uncertain_band: tuple[float, float],
+) -> Verdict:
+    """Re-derive a stored result's verdict under a new threshold/band.
+
+    ``ERROR`` results keep their verdict: their stored ``score`` is a 0.0
+    placeholder, so re-thresholding would silently turn a failed file into
+    REAL (or NO_FACE).
+    """
+    if result.verdict == Verdict.ERROR or result.error:
+        return Verdict.ERROR
+    return verdict_from_score(result.score, threshold, uncertain_band, result.faces_analyzed)
 
 
 def derive_segments(

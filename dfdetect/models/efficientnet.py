@@ -19,6 +19,36 @@ log = logging.getLogger(__name__)
 # arrays instead of allocating a fresh tuple→array conversion per call.
 _MEAN = np.array((0.485, 0.456, 0.406), dtype=np.float32)
 _INV_STD = (1.0 / np.array((0.229, 0.224, 0.225), dtype=np.float32))
+_TIMM_NAME = "tf_efficientnet_b4"
+# Wrapper prefixes added by DataParallel/DDP or Lightning-style modules.
+_STRIP_PREFIXES = ("module.", "model.")
+
+
+def _load_checkpoint(model: Any, state: Any, path: Path) -> None:
+    """Load ``state`` into ``model``, failing loudly on a mismatch.
+
+    ``strict=False`` alone would silently leave the network randomly
+    initialised if the checkpoint came from a different backbone or was saved
+    from a wrapper — every score would then be noise with no error raised.
+    """
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    if not isinstance(state, dict):
+        raise RuntimeError(f"{path} does not contain a state_dict.")
+    for prefix in _STRIP_PREFIXES:
+        if state and all(k.startswith(prefix) for k in state):
+            state = {k[len(prefix):]: v for k, v in state.items()}
+    result = model.load_state_dict(state, strict=False)
+    if result.missing_keys:
+        raise RuntimeError(
+            f"{path} is not a {_TIMM_NAME} checkpoint: {len(result.missing_keys)} "
+            f"parameters missing (e.g. {result.missing_keys[:3]})."
+        )
+    if result.unexpected_keys:
+        log.warning(
+            "Ignoring %d unexpected keys in %s (e.g. %s).",
+            len(result.unexpected_keys), path, result.unexpected_keys[:3],
+        )
 
 
 @register_model("efficientnet_b4")
@@ -38,7 +68,7 @@ class EfficientNetB4(DeepfakeModel):
         self._weights_dir = weights_dir
         self._weights_url = weights_url
         self._weights_sha256 = weights_sha256
-        self._model = None  # lazy-built on first use
+        self._model: Any = None  # lazy-built on first use
 
     def _resolve_weights(self) -> Path | None:
         try:
@@ -63,13 +93,12 @@ class EfficientNetB4(DeepfakeModel):
         if resolved is not None:
             self.weights_path = resolved
 
-        model = timm.create_model("tf_efficientnet_b4", pretrained=False, num_classes=2)
-
         if self.weights_path and self.weights_path.exists():
-            state = torch.load(self.weights_path, map_location="cpu")
-            if isinstance(state, dict) and "state_dict" in state:
-                state = state["state_dict"]
-            model.load_state_dict(state, strict=False)
+            model = timm.create_model(_TIMM_NAME, pretrained=False, num_classes=2)
+            # ``weights_only`` refuses arbitrary pickled objects, so a
+            # downloaded checkpoint can't execute code on load.
+            state = torch.load(self.weights_path, map_location="cpu", weights_only=True)
+            _load_checkpoint(model, state, self.weights_path)
         else:
             log.warning(
                 "No deepfake weights provided. Falling back to ImageNet-pretrained backbone — "
@@ -77,7 +106,7 @@ class EfficientNetB4(DeepfakeModel):
                 "model.url (remote download), or register a default in "
                 "dfdetect.models.downloader.WEIGHT_SOURCES."
             )
-            model = timm.create_model("tf_efficientnet_b4", pretrained=True, num_classes=2)
+            model = timm.create_model(_TIMM_NAME, pretrained=True, num_classes=2)
 
         model.eval().to(self.device)
         self._model = model

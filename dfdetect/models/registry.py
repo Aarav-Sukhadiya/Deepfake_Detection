@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
-from ..config import ModelConfig, ModelMemberConfig
+from ..config import CalibrationConfig, ModelConfig
 from .base import DeepfakeModel
 
 _REGISTRY: dict[str, Callable[..., DeepfakeModel]] = {}
@@ -48,7 +48,7 @@ def build_model(cfg: ModelConfig, device: str = "cpu", weights_dir: Path | None 
     from .calibration import CalibratedModel
     from .ensemble import EnsembleModel
 
-    def _wrap_calibration(model: DeepfakeModel, calib) -> DeepfakeModel:
+    def _wrap_calibration(model: DeepfakeModel, calib: CalibrationConfig) -> DeepfakeModel:
         if calib.temperature == 1.0 and calib.platt_a is None and calib.platt_b is None:
             return model
         return CalibratedModel(
@@ -66,7 +66,6 @@ def build_model(cfg: ModelConfig, device: str = "cpu", weights_dir: Path | None 
             )
         members: list[tuple[DeepfakeModel, float]] = []
         for m in cfg.members:
-            assert isinstance(m, ModelMemberConfig)
             inner = _build_single(m.name, m.weights, m.url, m.sha256, device, weights_dir)
             members.append((_wrap_calibration(inner, m.calibration), m.weight))
         ensemble = EnsembleModel(members)

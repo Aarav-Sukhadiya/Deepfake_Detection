@@ -27,6 +27,7 @@ created, extras are pruned.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import random
 import re
@@ -120,7 +121,7 @@ def _stratified_sample(files: list[Path], k: int, rng: random.Random) -> list[Pa
     total = sum(len(v) for v in buckets.values())
     out: list[Path] = []
     leftover: list[Path] = []
-    for actor, lst in buckets.items():
+    for lst in buckets.values():
         rng.shuffle(lst)
         quota = max(1, round(k * len(lst) / total))
         out.extend(lst[:quota])
@@ -148,15 +149,18 @@ def _materialise(files: list[Path], dest: Path, *, dry_run: bool, dup: int = 1) 
     dest.mkdir(parents=True, exist_ok=True)
     wanted: dict[str, Path] = {}
     for src in files:
-        rid = abs(hash(str(src.resolve()))) % (16**6)
-        base = f"{rid:06x}__{src.name}"
+        # sha1, not ``hash()``: str hashing is salted per process, so the old
+        # prefix changed every run and "idempotent" re-runs relinked + pruned
+        # everything.
+        rid = hashlib.sha1(str(src.resolve()).encode()).hexdigest()[:6]
+        base = f"{rid}__{src.name}"
         if dup <= 1:
             wanted[base] = src
         else:
             stem = src.stem
             ext = src.suffix
             for k in range(dup):
-                name = f"{rid:06x}__{stem}__dup{k}{ext}"
+                name = f"{rid}__{stem}__dup{k}{ext}"
                 wanted[name] = src
 
     existing = {p.name: p for p in dest.iterdir() if p.is_file()}
